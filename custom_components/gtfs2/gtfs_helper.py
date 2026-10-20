@@ -1,6 +1,7 @@
 """Support for GTFS Integration."""
 from __future__ import annotations
 
+import bisect
 import datetime
 import time
 import logging
@@ -14,6 +15,7 @@ import multiprocessing
 from multiprocessing import Process
 from . import zip_file as zipfile
 from pathlib import Path
+
 
 
 import homeassistant.util.dt as dt_util
@@ -38,12 +40,13 @@ from .const import (
     TIME_STR_FORMAT
     )
 from .gtfs_rt_helper import get_rt_route_trip_statuses, get_gtfs_rt
+from .redact import Redacted
 
 _LOGGER = logging.getLogger(__name__)
 
 
 def get_next_departure(hass, _data):
-    _LOGGER.debug("Get next departure with data: %s", _data)
+    _LOGGER.debug("Get next departure with data: %s", Redacted(_data))
     if check_extracting(hass, _data['gtfs_dir'],_data['file']):
         _LOGGER.debug("Cannot get next departures on this datasource as still unpacking: %s", _data["file"])
         return {}
@@ -52,22 +55,36 @@ def get_next_departure(hass, _data):
 
     schedule = _data["schedule"]
     route_type = _data["route_type"]
+    destination_raw = str(_data.get("destination") or "")
+    no_destination = not destination_raw.strip()
+    configured_route_id = str(_data.get("route") or "").strip()
+    if configured_route_id == "train":
+        configured_route_id = ""
+    configured_direction = str(_data.get("direction") or "").strip()
     
     # if type 2 (train) then filter on that and use name-like search 
     if route_type == "2":
         route_type_where = f"route_type in (2,100,101,102,103,104,105,106,107,108, 109,100,111,112,113,114,115,116,117)"
         start_station_id = str(_data['origin'])+'%'
-        end_station_id = str(_data['destination'])+'%'
+        end_station_id = destination_raw+'%'
         start_station_where = f"AND start_station.stop_id in (select stop_id from stops where stop_name like :origin_station_id)"
-        end_station_where = f"AND end_station.stop_id in (select stop_id from stops where stop_name like :end_station_id)"
+        end_station_where = (
+            ""
+            if no_destination
+            else "AND end_station.stop_id in (select stop_id from stops where stop_name like :end_station_id)"
+        )
         _LOGGER.debug("Setting up TRAIN Route for start/end : %s / %s ", start_station_id, end_station_id)
     else:
         route_type_where = "1=1"
         start_station_id = _data['origin'].split(': ')[0]
-        end_station_id = _data['destination'].split(': ')[0]
+        end_station_id = destination_raw.split(': ')[0]
         start_station_where = f"AND start_station.stop_id = :origin_station_id"
-        end_station_where = f"AND end_station.stop_id = :end_station_id"
+        end_station_where = "" if no_destination else "AND end_station.stop_id = :end_station_id"
         _LOGGER.debug("Setting up Route for start/end : %s / %s ", start_station_id, end_station_id)
+    if no_destination and configured_route_id:
+        start_station_where += " AND trip.route_id = :configured_route_id"
+    if no_destination and configured_direction in {"0", "1"}:
+        start_station_where += " AND (trip.direction_id = :configured_direction OR trip.direction_id IS NULL)"
     offset = _data["offset"]
     include_tomorrow = _data["include_tomorrow"]
     now = dt_util.now().replace(tzinfo=None) + datetime.timedelta(minutes=offset)
@@ -82,215 +99,403 @@ def get_next_departure(hass, _data):
     tomorrow_date = tomorrow.strftime(dt_util.DATE_STR_FORMAT)
     tomorrow_date_local_tz = tomorrow_local_tz.strftime(dt_util.DATE_STR_FORMAT)
 
-    # Fetch all departures for yesterday, today and optionally tomorrow,
-    # up to an overkill maximum in case of a departure every minute for those
-    # days.
-    limit = 24 * 60 * 60 * 2
-    tomorrow_select = tomorrow_select2 = tomorrow_where = tomorrow_order = ""
-    tomorrow_calendar_date_where = f"AND (calendar_date_today.date = date('now'))"
-    if include_tomorrow:
-        _LOGGER.debug("Includes Tomorrow")
-        limit = int(limit / 2 * 3)
-        tomorrow_name = tomorrow.strftime("%A").lower()
-        tomorrow_select = f"( select calendar.{tomorrow_name} - ( select case when (select '1' from calendar_dates where service_id=trip.service_id and date = {tomorrow_date} and exception_type = 2 ) == '1' then '1' else '0' end) ) as tomorrow,"
-        tomorrow_where = f"OR calendar.{tomorrow_name} = 1"
-        tomorrow_order = f"calendar.{tomorrow_name} DESC,"
-        tomorrow_calendar_date_where = f"AND (calendar_date_today.date = date('now') or calendar_date_today.date = date('now','+1 day') )"
-        tomorrow_select2 = f"CASE WHEN date('now') < calendar_date_today.date THEN 1 else 0 END as tomorrow,"
-    sql_query = f"""
-        SELECT trip.trip_id, trip.route_id,trip.trip_headsign, trip.direction_id,trip.trip_short_name,
-               route.route_long_name,route.route_short_name,
-        	   start_station.stop_id as origin_stop_id,
-               start_station.stop_name as origin_stop_name,
-               start_station.stop_timezone as origin_stop_timezone,
-               agency.agency_timezone as agency_timezone,
-               time(origin_stop_time.arrival_time) AS origin_arrival_time,
-               time(origin_stop_time.departure_time) AS origin_depart_time,
-               date(origin_stop_time.departure_time) AS origin_depart_date,
-               origin_stop_time.drop_off_type AS origin_drop_off_type,
-               origin_stop_time.pickup_type AS origin_pickup_type,
-               origin_stop_time.shape_dist_traveled AS origin_dist_traveled,
-               origin_stop_time.stop_headsign AS origin_stop_headsign,
-               origin_stop_time.stop_sequence AS origin_stop_sequence,
-               origin_stop_time.timepoint AS origin_stop_timepoint,
-               end_station.stop_id as dest_stop_id,
-               end_station.stop_name as dest_stop_name,
-               end_station.stop_timezone as dest_stop_timezone,
-               time(destination_stop_time.arrival_time) AS dest_arrival_time,
-               time(destination_stop_time.departure_time) AS dest_depart_time,
-               destination_stop_time.drop_off_type AS dest_drop_off_type,
-               destination_stop_time.pickup_type AS dest_pickup_type,
-               destination_stop_time.shape_dist_traveled AS dest_dist_traveled,
-               destination_stop_time.stop_headsign AS dest_stop_headsign,
-               destination_stop_time.stop_sequence AS dest_stop_sequence,
-               destination_stop_time.timepoint AS dest_stop_timepoint,
-               calendar.{yesterday.strftime("%A").lower()} AS yesterday,
-               ( select calendar.{now.strftime("%A").lower()} - (  select case when (select '1' from calendar_dates where service_id=trip.service_id and date = date('now') and exception_type = 2 ) == '1' then '1' else '0' end  ) ) as today,
-               {tomorrow_select}
-               calendar.start_date AS start_date,
-               calendar.end_date AS end_date,
-               "" as calendar_date,
-               0 as today_cd
-        FROM trips trip
-        INNER JOIN calendar calendar
-                   ON trip.service_id = calendar.service_id
-        INNER JOIN stop_times origin_stop_time
-                   ON trip.trip_id = origin_stop_time.trip_id
-        INNER JOIN stops start_station
-                   ON origin_stop_time.stop_id = start_station.stop_id
-        INNER JOIN stop_times destination_stop_time
-                   ON trip.trip_id = destination_stop_time.trip_id
-        INNER JOIN stops end_station
-                   ON destination_stop_time.stop_id = end_station.stop_id
-        INNER JOIN routes route
-                   ON route.route_id = trip.route_id 
-        INNER JOIN agency agency
-                   ON route.agency_id = agency.agency_id                 
-		WHERE {route_type_where}
-        {start_station_where}
-        {end_station_where}
-        AND origin_stop_sequence < dest_stop_sequence
-        AND calendar.start_date <= date('now')
-        AND calendar.end_date >= date('now')
-		UNION ALL
-	    SELECT trip.trip_id, trip.route_id,trip.trip_headsign, trip.direction_id,trip.trip_short_name,
-               route.route_long_name,route.route_short_name,
-               start_station.stop_id as origin_stop_id,
-               start_station.stop_name as origin_stop_name,
-               start_station.stop_timezone as origin_stop_timezone,
-               agency.agency_timezone as agency_timezone,
-               time(origin_stop_time.arrival_time) AS origin_arrival_time,
-               time(origin_stop_time.departure_time) AS origin_depart_time,
-               date(origin_stop_time.departure_time) AS origin_depart_date,
-               origin_stop_time.drop_off_type AS origin_drop_off_type,
-               origin_stop_time.pickup_type AS origin_pickup_type,
-               origin_stop_time.shape_dist_traveled AS origin_dist_traveled,
-               origin_stop_time.stop_headsign AS origin_stop_headsign,
-               origin_stop_time.stop_sequence AS origin_stop_sequence,
-               origin_stop_time.timepoint AS origin_stop_timepoint,
-               end_station.stop_id as dest_stop_id,
-               end_station.stop_name as dest_stop_name,
-               end_station.stop_timezone as dest_stop_timezone,
-               time(destination_stop_time.arrival_time) AS dest_arrival_time,
-               time(destination_stop_time.departure_time) AS dest_depart_time,
-               destination_stop_time.drop_off_type AS dest_drop_off_type,
-               destination_stop_time.pickup_type AS dest_pickup_type,
-               destination_stop_time.shape_dist_traveled AS dest_dist_traveled,
-               destination_stop_time.stop_headsign AS dest_stop_headsign,
-               destination_stop_time.stop_sequence AS dest_stop_sequence,
-               destination_stop_time.timepoint AS dest_stop_timepoint,
-               '0' AS yesterday,
-               '0' AS today,
-               {tomorrow_select2}
-               date('now') AS start_date,
-               date('now') AS end_date,
-               calendar_date_today.date as calendar_date,
-               calendar_date_today.exception_type as today_cd
-        FROM trips trip
-        INNER JOIN stop_times origin_stop_time
-                   ON trip.trip_id = origin_stop_time.trip_id
-        INNER JOIN stops start_station
-                   ON origin_stop_time.stop_id = start_station.stop_id
-        INNER JOIN stop_times destination_stop_time
-                   ON trip.trip_id = destination_stop_time.trip_id
-        INNER JOIN stops end_station
-                   ON destination_stop_time.stop_id = end_station.stop_id
-        INNER JOIN routes route
-                   ON route.route_id = trip.route_id 
-        INNER JOIN calendar_dates calendar_date_today
-				   ON trip.service_id = calendar_date_today.service_id
-        INNER JOIN agency agency
-                   ON route.agency_id = agency.agency_id                    
-		WHERE {route_type_where}
-        {start_station_where}
-        {end_station_where}
-		AND origin_stop_sequence < dest_stop_sequence
-        AND today_cd = 1
-		{tomorrow_calendar_date_where}
-        ORDER BY calendar_date,origin_depart_date, today_cd, origin_depart_time
-        """  # noqa: S608
-    # Create lookup timetable for today and possibly tomorrow, taking into
-    # account any departures from yesterday scheduled after midnight,
-    # as long as all departures are within the calendar date range.
-    timetable = {}
-    yesterday_start = today_start = tomorrow_start = None
-    yesterday_last = today_last = ""        
-    with schedule.engine.connect() as conn:
-        result = conn.execute(
-            text(sql_query),
-            {
-                "origin_station_id": start_station_id,
-                "end_station_id": end_station_id,
-                "limit": limit,
-                "route_type": route_type,
-                "now_time": now_time,
-            },
-        )
-        rows = result.fetchall()
-        
-    for row_cursor in rows:
-        row = row_cursor._asdict()
-        if row["yesterday"] == 1 and yesterday_date >= row["start_date"]:
-            extras = {"day": "yesterday", "first": None, "last": False}
-            if yesterday_start is None:
-                yesterday_start = row["origin_depart_date"]
-            if yesterday_start != row["origin_depart_date"]:
-                idx = f"{now_date_local_tz} {row['origin_depart_time']}"
-                timetable[idx] = {**row, **extras}
-                yesterday_last = idx
-        if row["today"] == 1 or row["today_cd"] == 1:
-            extras = {"day": "today", "first": False, "last": False}
-            if today_start is None:
-                today_start = row["origin_depart_date"]
-                extras["first"] = True
-            if today_start == row["origin_depart_date"]:
-                idx_prefix = now_date_local_tz
-            else:
-                idx_prefix = tomorrow_date_local_tz
-            # For feeds that store all dates as 1970-01-01, departure times later in
-            # the day than the current time but far enough back to have already run
-            # should roll over to tomorrow's date prefix.
-            if row["origin_depart_date"] == '1970-01-01' and row["today"] == 1:
-                depart_dt = datetime.datetime.strptime(
-                    f"{now_date_local_tz} {row['origin_depart_time']}", "%Y-%m-%d %H:%M:%S"
-                )
-                if depart_dt < now - datetime.timedelta(minutes=offset + 60):
-                    idx_prefix = tomorrow_date_local_tz
-            idx = f"{idx_prefix} {row['origin_depart_time']}"
-            timetable[idx] = {**row, **extras}
-            today_last = idx      
-        if (
-            "tomorrow" in row
-            and row["tomorrow"] == 1
-            and ( tomorrow_date <= row["end_date"] or tomorrow_date == row["calendar_date"])
-        ):
-            extras = {"day": "tomorrow", "first": False, "last": None}
-            if tomorrow_start is None:
-                tomorrow_start = row["origin_depart_date"]
-                extras["first"] = True
-            if tomorrow_start == row["origin_depart_date"]:
-                idx_prefix = tomorrow_date_local_tz
-            idx = f"{idx_prefix} {row['origin_depart_time']}"
-            timetable[idx] = {**row, **extras}
-    # Flag last departures.
-    for idx in filter(None, [yesterday_last, today_last]):
-        timetable[idx]["last"] = True
-    item = {}
-    for key in sorted(timetable.keys()):
-        if datetime.datetime.strptime(key, "%Y-%m-%d %H:%M:%S") > now:
-            item = timetable[key]
-            _LOGGER.info(
-                "Departure(s) found for station %s @ %s -> %s", start_station_id, key, item
+    # Static timetable cache — skip SQL query if timetable is still valid
+    _static_cache = _data.get("static_cache")
+    if (_static_cache is not None
+            and _static_cache.get("valid_until_tomorrow") == tomorrow_date_local_tz
+            and _static_cache.get("cached_date") == now_date_local_tz
+            and _static_cache.get("timetable")
+            and _static_cache.get("route") == _data.get("route")
+            and _static_cache.get("no_destination") == no_destination
+            and _static_cache.get("direction") == configured_direction):
+        timetable = _static_cache["timetable"]
+        keys_sorted = _static_cache.get("keys_sorted", sorted(timetable.keys()))
+        _LOGGER.debug("Static timetable cache hit for: %s", _data["name"])
+    else:
+        _LOGGER.debug("Static timetable cache miss — querying SQLite for: %s", _data["name"])
+        # Fetch all departures for yesterday, today and optionally tomorrow,
+        # up to an overkill maximum in case of a departure every minute for those
+        # days.
+        limit = 24 * 60 * 60 * 2
+        tomorrow_select = tomorrow_select2 = tomorrow_where = tomorrow_order = ""
+        tomorrow_calendar_date_where = f"AND (calendar_date_today.date = '{now_date}')"
+        service_calendar_where = f"""(calendar.{now.strftime("%A").lower()} = 1
+            AND NOT EXISTS (
+                SELECT 1 FROM calendar_dates excluded_service
+                WHERE excluded_service.service_id = trip.service_id
+                  AND excluded_service.date = '{now_date}'
+                  AND excluded_service.exception_type = 2
             )
-            break
+            AND NOT EXISTS (
+                SELECT 1
+                FROM trips added_service_trip
+                JOIN calendar_dates added_service_date
+                  ON added_service_date.service_id = added_service_trip.service_id
+                WHERE added_service_trip.route_id = trip.route_id
+                  AND added_service_date.date = '{now_date}'
+                  AND added_service_date.exception_type = 1
+            )"""
+        if include_tomorrow:
+            _LOGGER.debug("Includes Tomorrow")
+            limit = int(limit / 2 * 3)
+            tomorrow_name = tomorrow.strftime("%A").lower()
+            tomorrow_select = f"( select calendar.{tomorrow_name} - ( select case when (select '1' from calendar_dates where service_id=trip.service_id and date = {tomorrow_date} and exception_type = 2 ) == '1' then '1' else '0' end) ) as tomorrow,"
+            tomorrow_where = f"OR calendar.{tomorrow_name} = 1"
+            tomorrow_order = f"calendar.{tomorrow_name} DESC,"
+            tomorrow_calendar_date_where = f"AND (calendar_date_today.date = '{now_date}' or calendar_date_today.date = '{tomorrow_date}')"
+            tomorrow_select2 = f"CASE WHEN '{now_date}' < calendar_date_today.date THEN 1 else 0 END as tomorrow,"
+            service_calendar_where += f""" OR (
+                calendar.{tomorrow_name} = 1
+                AND NOT EXISTS (
+                    SELECT 1 FROM calendar_dates excluded_tomorrow
+                    WHERE excluded_tomorrow.service_id = trip.service_id
+                      AND excluded_tomorrow.date = '{tomorrow_date}'
+                      AND excluded_tomorrow.exception_type = 2
+                )
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM trips added_tomorrow_trip
+                    JOIN calendar_dates added_tomorrow_date
+                      ON added_tomorrow_date.service_id = added_tomorrow_trip.service_id
+                    WHERE added_tomorrow_trip.route_id = trip.route_id
+                      AND added_tomorrow_date.date = '{tomorrow_date}'
+                      AND added_tomorrow_date.exception_type = 1
+                )
+            ))"""
+        if no_destination:
+            destination_join = """INNER JOIN stop_times destination_stop_time
+                    ON trip.trip_id = destination_stop_time.trip_id
+                    AND destination_stop_time.stop_sequence = (
+                        SELECT MAX(terminal_stop_time.stop_sequence)
+                        FROM stop_times terminal_stop_time
+                        WHERE terminal_stop_time.trip_id = trip.trip_id
+                    )
+            INNER JOIN stops end_station
+                    ON destination_stop_time.stop_id = end_station.stop_id"""
+            destination_sequence_where = ""
+        else:
+            destination_join = """INNER JOIN stop_times destination_stop_time
+                    ON trip.trip_id = destination_stop_time.trip_id
+            INNER JOIN stops end_station
+                    ON destination_stop_time.stop_id = end_station.stop_id"""
+            destination_sequence_where = "AND origin_stop_sequence < dest_stop_sequence"
+
+        sql_query = f"""
+            SELECT trip.trip_id, trip.route_id,trip.trip_headsign, trip.direction_id,trip.trip_short_name,
+                route.route_long_name,route.route_short_name,route.route_type,
+                start_station.stop_id as origin_stop_id,
+                start_station.stop_name as origin_stop_name,
+                start_station.stop_timezone as origin_stop_timezone,
+                agency.agency_timezone as agency_timezone,
+                time(origin_stop_time.arrival_time) AS origin_arrival_time,
+                time(origin_stop_time.departure_time) AS origin_depart_time,
+                date(origin_stop_time.departure_time) AS origin_depart_date,
+                origin_stop_time.drop_off_type AS origin_drop_off_type,
+                origin_stop_time.pickup_type AS origin_pickup_type,
+                origin_stop_time.shape_dist_traveled AS origin_dist_traveled,
+                origin_stop_time.stop_headsign AS origin_stop_headsign,
+                origin_stop_time.stop_sequence AS origin_stop_sequence,
+                origin_stop_time.timepoint AS origin_stop_timepoint,
+                end_station.stop_id as dest_stop_id,
+                end_station.stop_name as dest_stop_name,
+                end_station.stop_timezone as dest_stop_timezone,
+                time(destination_stop_time.arrival_time) AS dest_arrival_time,
+                time(destination_stop_time.departure_time) AS dest_depart_time,
+                destination_stop_time.drop_off_type AS dest_drop_off_type,
+                destination_stop_time.pickup_type AS dest_pickup_type,
+                destination_stop_time.shape_dist_traveled AS dest_dist_traveled,
+                destination_stop_time.stop_headsign AS dest_stop_headsign,
+                destination_stop_time.stop_sequence AS dest_stop_sequence,
+                destination_stop_time.timepoint AS dest_stop_timepoint,
+                calendar.{yesterday.strftime("%A").lower()} AS yesterday,
+                ( select calendar.{now.strftime("%A").lower()} - (  select case when (select '1' from calendar_dates where service_id=trip.service_id and date = '{now_date}' and exception_type = 2 ) == '1' then '1' else '0' end  ) ) as today,
+                {tomorrow_select}
+                calendar.start_date AS start_date,
+                calendar.end_date AS end_date,
+                "" as calendar_date,
+                0 as today_cd
+            FROM trips trip
+            INNER JOIN calendar calendar
+                    ON trip.service_id = calendar.service_id
+            INNER JOIN stop_times origin_stop_time
+                    ON trip.trip_id = origin_stop_time.trip_id
+            INNER JOIN stops start_station
+                    ON origin_stop_time.stop_id = start_station.stop_id
+            {destination_join}
+            INNER JOIN routes route
+                    ON route.route_id = trip.route_id 
+            INNER JOIN agency agency
+                    ON route.agency_id = agency.agency_id                 
+            WHERE {route_type_where}
+            {start_station_where}
+            {end_station_where}
+            {destination_sequence_where}
+             AND {service_calendar_where}
+            AND calendar.start_date <= '{now_date}'
+            AND calendar.end_date >= '{now_date}'
+            UNION ALL
+            SELECT trip.trip_id, trip.route_id,trip.trip_headsign, trip.direction_id,trip.trip_short_name,
+                route.route_long_name,route.route_short_name,route.route_type,
+                start_station.stop_id as origin_stop_id,
+                start_station.stop_name as origin_stop_name,
+                start_station.stop_timezone as origin_stop_timezone,
+                agency.agency_timezone as agency_timezone,
+                time(origin_stop_time.arrival_time) AS origin_arrival_time,
+                time(origin_stop_time.departure_time) AS origin_depart_time,
+                date(origin_stop_time.departure_time) AS origin_depart_date,
+                origin_stop_time.drop_off_type AS origin_drop_off_type,
+                origin_stop_time.pickup_type AS origin_pickup_type,
+                origin_stop_time.shape_dist_traveled AS origin_dist_traveled,
+                origin_stop_time.stop_headsign AS origin_stop_headsign,
+                origin_stop_time.stop_sequence AS origin_stop_sequence,
+                origin_stop_time.timepoint AS origin_stop_timepoint,
+                end_station.stop_id as dest_stop_id,
+                end_station.stop_name as dest_stop_name,
+                end_station.stop_timezone as dest_stop_timezone,
+                time(destination_stop_time.arrival_time) AS dest_arrival_time,
+                time(destination_stop_time.departure_time) AS dest_depart_time,
+                destination_stop_time.drop_off_type AS dest_drop_off_type,
+                destination_stop_time.pickup_type AS dest_pickup_type,
+                destination_stop_time.shape_dist_traveled AS dest_dist_traveled,
+                destination_stop_time.stop_headsign AS dest_stop_headsign,
+                destination_stop_time.stop_sequence AS dest_stop_sequence,
+                destination_stop_time.timepoint AS dest_stop_timepoint,
+                '0' AS yesterday,
+                '0' AS today,
+                {tomorrow_select2}
+                '{now_date}' AS start_date,
+                '{now_date}' AS end_date,
+                calendar_date_today.date as calendar_date,
+                calendar_date_today.exception_type as today_cd
+            FROM trips trip
+            INNER JOIN stop_times origin_stop_time
+                    ON trip.trip_id = origin_stop_time.trip_id
+            INNER JOIN stops start_station
+                    ON origin_stop_time.stop_id = start_station.stop_id
+            {destination_join}
+            INNER JOIN routes route
+                    ON route.route_id = trip.route_id 
+            INNER JOIN calendar_dates calendar_date_today
+                    ON trip.service_id = calendar_date_today.service_id
+            INNER JOIN agency agency
+                    ON route.agency_id = agency.agency_id                    
+            WHERE {route_type_where}
+            {start_station_where}
+            {end_station_where}
+            {destination_sequence_where}
+            AND today_cd = 1
+            {tomorrow_calendar_date_where}
+            UNION ALL
+            SELECT trip.trip_id, trip.route_id,trip.trip_headsign, trip.direction_id,trip.trip_short_name,
+                route.route_long_name,route.route_short_name,route.route_type,
+                start_station.stop_id as origin_stop_id,
+                start_station.stop_name as origin_stop_name,
+                start_station.stop_timezone as origin_stop_timezone,
+                agency.agency_timezone as agency_timezone,
+                time(origin_stop_time.arrival_time) AS origin_arrival_time,
+                time(origin_stop_time.departure_time) AS origin_depart_time,
+                date(origin_stop_time.departure_time) AS origin_depart_date,
+                origin_stop_time.drop_off_type AS origin_drop_off_type,
+                origin_stop_time.pickup_type AS origin_pickup_type,
+                origin_stop_time.shape_dist_traveled AS origin_dist_traveled,
+                origin_stop_time.stop_headsign AS origin_stop_headsign,
+                origin_stop_time.stop_sequence AS origin_stop_sequence,
+                origin_stop_time.timepoint AS origin_stop_timepoint,
+                end_station.stop_id as dest_stop_id,
+                end_station.stop_name as dest_stop_name,
+                end_station.stop_timezone as dest_stop_timezone,
+                time(destination_stop_time.arrival_time) AS dest_arrival_time,
+                time(destination_stop_time.departure_time) AS dest_depart_time,
+                destination_stop_time.drop_off_type AS dest_drop_off_type,
+                destination_stop_time.pickup_type AS dest_pickup_type,
+                destination_stop_time.shape_dist_traveled AS dest_dist_traveled,
+                destination_stop_time.stop_headsign AS dest_stop_headsign,
+                destination_stop_time.stop_sequence AS dest_stop_sequence,
+                destination_stop_time.timepoint AS dest_stop_timepoint,
+                '1' AS yesterday,
+                '0' AS today,
+                '0' AS tomorrow,
+                '{yesterday_date}' AS start_date,
+                '{yesterday_date}' AS end_date,
+                COALESCE(calendar_date_yesterday.date, '{yesterday_date}') as calendar_date,
+                COALESCE(calendar_date_yesterday.exception_type, 0) as today_cd
+            FROM trips trip
+            INNER JOIN stop_times origin_stop_time
+                    ON trip.trip_id = origin_stop_time.trip_id
+            INNER JOIN stops start_station
+                    ON origin_stop_time.stop_id = start_station.stop_id
+            {destination_join}
+            INNER JOIN routes route
+                    ON route.route_id = trip.route_id
+            LEFT JOIN calendar calendar_yesterday
+                    ON trip.service_id = calendar_yesterday.service_id
+            LEFT JOIN calendar_dates calendar_date_yesterday
+                    ON trip.service_id = calendar_date_yesterday.service_id
+            INNER JOIN agency agency
+                    ON route.agency_id = agency.agency_id
+            WHERE {route_type_where}
+            {start_station_where}
+            {end_station_where}
+            {destination_sequence_where}
+            AND (
+                (
+                    calendar_yesterday.{yesterday.strftime("%A").lower()} = 1
+                    AND calendar_yesterday.start_date <= '{yesterday_date}'
+                    AND calendar_yesterday.end_date >= '{yesterday_date}'
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM calendar_dates excluded_yesterday
+                        WHERE excluded_yesterday.service_id = trip.service_id
+                          AND excluded_yesterday.date = '{yesterday_date}'
+                          AND excluded_yesterday.exception_type = 2
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM trips added_yesterday_trip
+                        JOIN calendar_dates added_yesterday_date
+                          ON added_yesterday_date.service_id = added_yesterday_trip.service_id
+                        WHERE added_yesterday_trip.route_id = trip.route_id
+                          AND added_yesterday_date.date = '{yesterday_date}'
+                          AND added_yesterday_date.exception_type = 1
+                    )
+                )
+                OR (
+                    calendar_date_yesterday.date = '{yesterday_date}'
+                    AND calendar_date_yesterday.exception_type = 1
+                )
+            )
+            ORDER BY calendar_date,origin_depart_date, today_cd, origin_depart_time
+            """  # noqa: S608
+        # Create lookup timetable for today and possibly tomorrow, taking into
+        # account any departures from yesterday scheduled after midnight,
+        # as long as all departures are within the calendar date range.
+        timetable = {}
+        yesterday_start = today_start = tomorrow_start = None
+        yesterday_last = today_last = ""        
+        with schedule.engine.connect() as conn:
+            result = conn.execute(
+                text(sql_query),
+                {
+                    "origin_station_id": start_station_id,
+                    "end_station_id": end_station_id,
+                    "limit": limit,
+                    "route_type": route_type,
+                    "now_time": now_time,
+                    "configured_route_id": configured_route_id,
+                    "configured_direction": configured_direction,
+                },
+            )
+            rows = result.fetchall()
+            
+        for row_cursor in rows:
+            row = row_cursor._asdict()
+            if no_destination and configured_route_id and row["route_id"] != configured_route_id:
+                continue
+            if (
+                no_destination
+                and configured_direction in {"0", "1"}
+                and row["direction_id"] is not None
+                and str(row["direction_id"]) != configured_direction
+            ):
+                continue
+            if str(row["yesterday"]) == "1" and yesterday_date >= row["start_date"]:
+                extras = {"day": "yesterday", "first": None, "last": False}
+                if yesterday_start is None:
+                    yesterday_start = row["origin_depart_date"]
+                if yesterday_start != row["origin_depart_date"]:
+                    idx = f"{now_date_local_tz} {row['origin_depart_time']}"
+                    timetable[idx] = {**row, **extras}
+                    yesterday_last = idx
+            if str(row["today"]) == "1" or (
+                str(row["today_cd"]) == "1" and row["calendar_date"] == now_date
+            ):
+                extras = {"day": "today", "first": False, "last": False}
+                if today_start is None:
+                    today_start = row["origin_depart_date"]
+                    extras["first"] = True
+                if today_start == row["origin_depart_date"]:
+                    idx_prefix = now_date_local_tz
+                else:
+                    idx_prefix = tomorrow_date_local_tz
+                # For feeds that store all dates as 1970-01-01, departure times later in
+                # the day than the current time but far enough back to have already run
+                # should roll over to tomorrow's date prefix.
+                if row["origin_depart_date"] == '1970-01-01' and str(row["today"]) == "1":
+                    depart_dt = datetime.datetime.strptime(
+                        f"{now_date_local_tz} {row['origin_depart_time']}", "%Y-%m-%d %H:%M:%S"
+                    )
+                    if depart_dt < now - datetime.timedelta(minutes=offset + 60):
+                        idx_prefix = tomorrow_date_local_tz
+                idx = f"{idx_prefix} {row['origin_depart_time']}"
+                timetable[idx] = {**row, **extras}
+                today_last = idx      
+            if (
+                "tomorrow" in row
+                and                 str(row["tomorrow"]) == "1"
+                and ( tomorrow_date <= row["end_date"] or tomorrow_date == row["calendar_date"])
+            ):
+                extras = {"day": "tomorrow", "first": False, "last": None}
+                if tomorrow_start is None:
+                    tomorrow_start = row["origin_depart_date"]
+                    extras["first"] = True
+                if tomorrow_start == row["origin_depart_date"]:
+                    idx_prefix = tomorrow_date_local_tz
+                idx = f"{idx_prefix} {row['origin_depart_time']}"
+                timetable[idx] = {**row, **extras}
+        # Flag last departures.
+        for idx in filter(None, [yesterday_last, today_last]):
+            timetable[idx]["last"] = True
+        # Store rebuilt timetable in cache
+        _keys_sorted = sorted(timetable.keys())
+        _data["static_cache"] = {
+            "timetable": timetable,
+            "keys_sorted": _keys_sorted,
+            "valid_until_tomorrow": tomorrow_date_local_tz,
+            "cached_date": now_date_local_tz,
+            "route": _data.get("route"),
+            "no_destination": no_destination,
+            "direction": configured_direction,
+        }
+        keys_sorted = _keys_sorted
+    item = {}
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    idx = bisect.bisect_right(keys_sorted, now_str)
+    if idx < len(keys_sorted):
+        key = keys_sorted[idx]
+        item = timetable[key]
+        _LOGGER.info("Departure(s) found for station %s @ %s -> %s", start_station_id, key, item)
     _LOGGER.debug("Item(s) from SQL: %s", item)
     
     if item == {}:
-        data_returned = {        
-        "gtfs_updated_at": dt_util.utcnow().isoformat(),
-        }
+        _data["static_cache"] = None  # exhausted — force rebuild next cycle
         _LOGGER.info("No items found in gtfs")
         return {}
+    
+    if "intermediate_stops" not in item:
+        try:
+            with schedule.engine.connect() as conn:
+                result = conn.execute(
+                    text("""
+                        SELECT s.stop_name
+                        FROM stop_times st
+                        JOIN stops s ON st.stop_id = s.stop_id
+                        WHERE st.trip_id = :trip_id
+                        AND st.stop_sequence > :origin_seq
+                        AND st.stop_sequence < :dest_seq
+                        ORDER BY st.stop_sequence
+                    """),
+                    {
+                        "trip_id": item["trip_id"],
+                        "origin_seq": item["origin_stop_sequence"],
+                        "dest_seq": item["dest_stop_sequence"],
+                    }
+                )
+                stops = [row[0] for row in result.fetchall()]
+                item["intermediate_stops"] = " · ".join(stops) if stops else ""
+                _LOGGER.debug("Intermediate stops for trip %s: %s", item["trip_id"], item["intermediate_stops"])
+        except Exception as e:
+            _LOGGER.debug("Could not fetch intermediate stops: %s", e)
+            item["intermediate_stops"] = ""
 
     # Define timezone related attribs
     if hass.config.time_zone is None:
@@ -324,11 +529,15 @@ def get_next_departure(hass, _data):
     timetable_remaining_line = []
     timetable_remaining_headsign = []
     timetable_upcoming_trips = []
+    timetable_remaining_destinations = []
+    timetable_remaining_stops = []
+    stops_cache = {}
     ix = 0
     item = {}
-    for key, value in sorted(timetable.items()):
+    for key in keys_sorted[idx:]:
+        value = timetable[key]
         upcoming = datetime.datetime.strptime(key, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone)
-        _LOGGER.debug("Upcoming_departure_in_defined_timezone: %s, Now_in_defined_timezone_plus_offset: %s, key: %s, ix: %s", upcoming, now_local_tz, key, ix)
+        _LOGGER.debug(...)
         if upcoming > now_local_tz:
             if ix == 0:
                 _LOGGER.debug("Resetting item")
@@ -344,13 +553,47 @@ def get_next_departure(hass, _data):
                 utc_iso + " (" + str(value["trip_headsign"]) + ")"
             )
             timetable_upcoming_trips.append(str(value["trip_id"]))
+            timetable_remaining_destinations.append(
+                utc_iso + " (" + str(value["dest_stop_name"]) + ")"
+            )
+            # Fetch intermediate stops for this trip (cached by trip_id)
+            trip_id = str(value["trip_id"])
+            if trip_id not in stops_cache:
+                origin_seq = value.get("origin_stop_sequence")
+                dest_seq = value.get("dest_stop_sequence")
+                if origin_seq is not None and dest_seq is not None:
+                    try:
+                        with schedule.engine.connect() as conn:
+                            result = conn.execute(
+                                text("""
+                                    SELECT s.stop_name
+                                    FROM stop_times st
+                                    JOIN stops s ON st.stop_id = s.stop_id
+                                    WHERE st.trip_id = :trip_id
+                                    AND st.stop_sequence > :origin_seq
+                                    AND st.stop_sequence <= :dest_seq
+                                    ORDER BY st.stop_sequence
+                                """),
+                                {
+                                    "trip_id": trip_id,
+                                    "origin_seq": int(origin_seq),
+                                    "dest_seq": int(dest_seq),
+                                }
+                            )
+                            stops = [row[0] for row in result.fetchall()]
+                            stops_cache[trip_id] = " · ".join(stops) if stops else ""
+                    except Exception as e:
+                        _LOGGER.debug("Could not fetch intermediate stops for trip %s: %s", trip_id, e)
+                        stops_cache[trip_id] = ""
+                else:
+                    stops_cache[trip_id] = ""
+            timetable_remaining_stops.append(stops_cache[trip_id])
+
     _LOGGER.debug("Timetable Remaining Departures on this Start/Stop: %s", timetable_remaining)
     _LOGGER.debug("Timetable Remaining Departures on this Start/Stop, per line: %s", timetable_remaining_line)
     _LOGGER.debug("Timetable Remaining Departures on this Start/Stop, with headsign: %s", timetable_remaining_headsign)
     if item == {}:
-        data_returned = {
-        "gtfs_updated_at": dt_util.utcnow().isoformat(),
-        }
+        _data["static_cache"] = None  # exhausted — force rebuild next cycle
         _LOGGER.info("No items found in gtfs")
         return {}
 
@@ -442,12 +685,19 @@ def get_next_departure(hass, _data):
         "next_departures_lines": timetable_remaining_line,
         "next_departures_headsign": timetable_remaining_headsign,
         "next_departures_trip_id": timetable_upcoming_trips,
+        "next_departures_destinations": timetable_remaining_destinations,
+        "intermediate_stops": item.get("intermediate_stops", ""),
+        "next_departures_stops": (
+            []
+            if str(item.get("route_type")) in {"0", "1"}
+            else timetable_remaining_stops
+        ),
     }
     
     return data_returned
 
 def get_gtfs(hass, path, data, update=False):
-    _LOGGER.debug("Getting gtfs with data: %s", data)
+    _LOGGER.debug("Getting gtfs with data: %s", Redacted(data))
     _headers = None
     gtfs_dir = hass.config.path(path)
     os.makedirs(gtfs_dir, exist_ok=True)
@@ -581,12 +831,12 @@ def remove_from_zip(delmelist,gtfs_dir,file):
         os.rename(os.path.join(gtfs_dir, tempfile_out), os.path.join(gtfs_dir, filename))
         os.remove(os.path.join(gtfs_dir, tempfile)) 
     except Exception as ex:  # pylint: disable=broad-except
-        print('Something went wrong with the zipfile... : ', ex)
-        return     
+        _LOGGER.error("Something went wrong with the zipfile: %s", ex)
+        return
 
 
 def get_route_list(schedule, data):
-    _LOGGER.debug("Getting routes with data: %s", data)
+    _LOGGER.debug("Getting routes with data: %s", Redacted(data))
     route_type_where = ""
     agency_where = ""
     if data["agency"].split(': ')[0] != "0":
@@ -640,7 +890,7 @@ def get_stop_list(schedule, route_id, direction):
     return stops 
     
 def get_agency_list(schedule, data):
-    _LOGGER.debug("Getting agencies with data: %s", data)
+    _LOGGER.debug("Getting agencies with data: %s", Redacted(data))
     sql_agencies = f"""
     SELECT a.agency_id, a.agency_name 
     from agency a
@@ -817,7 +1067,7 @@ def check_datasource_index(hass, schedule, gtfs_dir, file):
             
 def create_trip_geojson(self):
     # not in use, awaiting geojson in HA-core to cover this type of geometry
-    _LOGGER.debug("Create geojson with data: %s", self._data)
+    _LOGGER.debug("Create geojson with data: %s", Redacted(self._data))
     schedule = self._data["schedule"]
     self._trip_id = self._data["next_departure"]["trip_id"]
     sql_shape = f"""
@@ -845,7 +1095,7 @@ def create_trip_geojson(self):
     return None
     
 def get_local_stop_list(hass, schedule, data):
-    _LOGGER.debug("Getting local stops list with data: %s", data)
+    _LOGGER.debug("Getting local stops list with data: %s", Redacted(data))
     device_tracker = hass.states.get(data['device_tracker_id'])
     latitude = device_tracker.attributes.get("latitude", None)
     longitude = device_tracker.attributes.get("longitude", None) 
@@ -865,7 +1115,7 @@ def get_local_stop_list(hass, schedule, data):
         
 
 def get_local_stops_next_departures(self):
-    _LOGGER.debug("Get local stop departure with data: %s", self._data)
+    _LOGGER.debug("Get local stop departure with data: %s", Redacted(self._data))
     if check_extracting(self.hass, self._data['gtfs_dir'],self._data['file']):
         _LOGGER.warning("Cannot get next depurtures on this datasource as still unpacking: %s", self._data["file"])
         return {}
@@ -987,11 +1237,11 @@ def get_local_stops_next_departures(self):
             CONF_ACCEPT_HEADER_PB :self._headers.get(CONF_ACCEPT_HEADER_PB,None),
             "file": self._data["name"] + "_localstop",
             }
-        _LOGGER.debug("self rt_data: %s, self headers: %s, self data: %s", self._rt_data, self._headers, self._data)
+        _LOGGER.debug("self rt_data: %s, self headers: %s, self data: %s", Redacted(self._rt_data), Redacted(self._headers), Redacted(self._data))
         check = get_gtfs_rt(self.hass,DEFAULT_PATH_RT,self._rt_data)
         # check if local file created
         if check != "ok":
-            _LOGGER.error("Could not download RT data from: %s", self._trip_update_url)
+            _LOGGER.error("Could not download RT data from: %s", Redacted(self._trip_update_url))
             return {}
         else:
             # use local file created as new url
@@ -1112,7 +1362,7 @@ def get_local_stops_next_departures(self):
     return data_returned
     
 async def update_gtfs_local_stops(hass, data): 
-    _LOGGER.debug("Update service for local stops with data: %s", data)
+    _LOGGER.debug("Update service for local stops with data: %s", Redacted(data))
     entries = []
     for entry in hass.config_entries.async_entries(DOMAIN):
         if entry.data.get("device_tracker_id") == data["entity_id"] :
@@ -1123,11 +1373,11 @@ async def update_gtfs_local_stops(hass, data):
     return
     
 async def get_route_departures(hass, data):
-    _LOGGER.debug("Getting route departures with data: %s", data)
+    _LOGGER.debug("Getting route departures with data: %s", Redacted(data))
     config_entry = hass.config_entries.async_get_entry(data.get("config_entry",""))
     cf_data = config_entry.data
     cf_options = config_entry.options
-    _LOGGER.debug("config entry data: %s, options: %s", cf_data, cf_options)
+    _LOGGER.debug("config entry data: %s, options: %s", Redacted(cf_data), Redacted(cf_options))
     
     now = dt_util.now().replace(tzinfo=None)
     now_date = now.strftime(dt_util.DATE_STR_FORMAT)
@@ -1157,10 +1407,6 @@ async def get_route_departures(hass, data):
             "next_departure_realtime_attr": {},
             "alert": {}
         }
-        
-    #if check_extracting(hass, _data['gtfs_dir'],_data['file']):    
-    #        _LOGGER.debug("Cannot update this sensor as still unpacking: %s", _data["file"])
-    #        return
 
     departures = await hass.async_add_executor_job(
                     get_next_departure, hass, _data
@@ -1188,7 +1434,7 @@ async def get_route_departures(hass, data):
     return _departures
     
 async def get_trip_stops(hass, data):
-    _LOGGER.debug("Getting stoptimes for trip with: %s", data)
+    _LOGGER.debug("Getting stoptimes for trip with: %s", Redacted(data))
     state = hass.states.get(data.get("entity_id",""))
     entity_registry = er.async_get(hass)
     entry = entity_registry.async_get(data.get("entity_id",""))

@@ -57,7 +57,7 @@
       "stops": {
         "data": {
           "origin": "Origin Stop",
-          "destination": "Destination Stop",
+          "destination": "Destination Stop (optional; blank uses the final stop)",
           "name": "Name of the route",
           "include_tomorrow": "Include tomorrow"
         },
@@ -66,7 +66,7 @@
       "stops_retry": {
         "data": {
           "origin": "Origin Stop",
-          "destination": "Destination Stop",
+          "destination": "Destination Stop (optional; blank uses the final stop)",
           "name": "Name of the route",
           "include_tomorrow": "Include tomorrow"
         },
@@ -75,7 +75,7 @@
 	  "stops_train": {
         "data": {
           "origin": "Enter the city of departure",
-          "destination": "Enter the city of arrival",
+          "destination": "Enter the city of arrival (optional; blank uses the final stop)",
           "name": "Name of the route",
           "refresh_interval": "Refresh interval in minutes",
           "include_tomorrow": "Include tomorrow"

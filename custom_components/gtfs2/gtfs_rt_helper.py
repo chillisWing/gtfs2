@@ -17,6 +17,8 @@ import binascii
 import base64
 from .requests_testadapter import Resp
 
+from .redact import Redacted
+
 _LOGGER = logging.getLogger(__name__)
 
 from .const import (
@@ -63,54 +65,64 @@ def due_in_minutes(timestamp):
     diff = timestamp - dt_util.now().replace(tzinfo=None)
     return int(diff.total_seconds() / 60)
 
-def get_gtfs_feed_entities(url: str, headers, label: str):
-    # Guard: if no URL configured for this feed type, skip silently
+
+def route_ids_match(left, right) -> bool:
+    """Match full and short GTFS route IDs used by different feeds."""
+    if left is None or right is None:
+        return False
+    left = str(left)
+    right = str(right)
+    return (
+        left == right
+        or left.rsplit("-", 1)[-1] == right.rsplit("-", 1)[-1]
+    )
+
+
+def get_gtfs_feed_entities_raw(url: str, headers, label: str):
+    """Fetch and parse a GTFS-RT feed. Called by the push task."""
     if not url:
-        _LOGGER.debug("GTFS RT get_feed_entities: no url configured for label: %s, skipping", label)
         return None
-
-    _LOGGER.debug(f"GTFS RT get_feed_entities for url: {url} , headers: {headers}, label: {label}")
+    _LOGGER.debug("GTFS RT fetching url: %s label: %s", Redacted(url), label)
     feed = gtfs_realtime_pb2.FeedMessage()  # type: ignore
-
-    # Ensure a User-Agent is always present. Some transit agency gateways
-    # (e.g. Azure Application Gateway used by TTC) return 403 when no
-    # User-Agent header is supplied, treating the request as a scraper.
     _default_headers = {
         "User-Agent": "Mozilla/5.0 (compatible; GTFS2-HomeAssistant/1.0)"
     }
     if headers:
         _default_headers.update(headers)
-
     if url.startswith('file'):
         requests_session = requests.session()
         requests_session.mount('file://', LocalFileAdapter())
-        response = requests_session.get(url)   
+        response = requests_session.get(url)
     else:
         response = requests.get(url, headers=_default_headers, timeout=20)
-
-    if response.status_code == 200 and "Bad Gateway" not in response.text and "Not Found" not in response.text :
+    if response.status_code == 200 and "Bad Gateway" not in response.text and "Not Found" not in response.text:
         _LOGGER.debug("Successfully updated %s", label)
     else:
-        _LOGGER.error("Trying to update %s, and got RT response(code): %s with text: %s", label, response.status_code, response.text)
+        _LOGGER.error("RT fetch failed for %s: %s %s", label, response.status_code, response.text)
         return None
-
-    if label == "alerts":
-        _LOGGER.debug("Feed : %s", feed)
-        
     try:
-        json_object = json.loads(response.text)    
         feed = json.loads(response.text)
-    except ValueError as e:   
+    except ValueError:
         _LOGGER.debug("GTFS RT data is not providing format json")
         if label == "vehicle_positions":
             feed = convert_gtfs_realtime_positions_to_json(response.content)
         elif label == "trip_data":
             feed = convert_gtfs_realtime_to_json(response.content)
-        else: # not yet converted to json
+        else:
             feed.ParseFromString(response.content)
-            return feed.entity            
-    
+            return feed.entity
     return feed.get('entity')
+
+
+def get_gtfs_feed_entities(url: str, headers, label: str, cache=None):
+    """Return RT entities from cache if available, else fetch directly."""
+    if not url:
+        _LOGGER.debug("GTFS RT get_feed_entities: no url configured for label: %s, skipping", label)
+        return None
+    if cache is not None:
+        return cache.get(url)
+    # No cache configured — fetch directly (fallback for debug/test)
+    return get_gtfs_feed_entities_raw(url, headers, label)
 
 def get_direction_from_static_gtfs(self, trip_id: str) -> str:
     """Resolve direction_id from static GTFS DB when RT feed omits it.
@@ -227,7 +239,7 @@ def get_rt_route_trip_statuses(self):
     # if route-based info is required, for start/end stops, then one needs to cover also for routes without direction_id and thus trip
     # if response does not provide a direction_id then use trip_id, make directon temporarily nn and when the stop is identified make it equal to the requesting direction
     # in this case the trip still covers the direction
-
+    _cache = getattr(self, '_rt_cache', None)
     departure_times = {}
 
     # Guard: if no trip update URL is configured (e.g. alerts-only feeds like
@@ -236,12 +248,19 @@ def get_rt_route_trip_statuses(self):
         _LOGGER.debug("No trip_update_url configured — skipping RT trip fetch")
         return departure_times
     
-    if self._vehicle_position_url:   
-        vehicle_positions = get_rt_vehicle_positions(self)
-
-    feed_entities = get_gtfs_feed_entities(
-        url=self._trip_update_url, headers=self._headers, label="trip_data"
-    )
+    if _cache is not None:
+        feed_entities = _cache.get_for_route(self._trip_update_url, self._route_id)
+        if feed_entities is None:
+            # Split cache cold — fall back to full list
+            feed_entities = get_gtfs_feed_entities(
+                url=self._trip_update_url, headers=self._headers, label="trip_data",
+                cache=_cache
+            )
+    else:
+        feed_entities = get_gtfs_feed_entities(
+            url=self._trip_update_url, headers=self._headers, label="trip_data",
+            cache=None
+        )
     self._feed_entities = feed_entities
     
     if not feed_entities:
@@ -249,6 +268,52 @@ def get_rt_route_trip_statuses(self):
         return {}
 
     _LOGGER.debug("Search departure times for route: %s, trip: %s, type: %s, direction: %s, short_name: %s", self._route_id, self._trip_id, self._rt_group, self._direction, self._trip_short_name)
+    configured_trip_ids = {
+        str(trip_id)
+        for trip_id in getattr(self, "_trip_ids", {self._trip_id})
+        if trip_id
+    }
+    is_subway_route = str(getattr(self, "_route_type", "")) == "1"
+    requested_direction = str(self._direction)
+    self._rt_upcoming_trip_ids = set()
+    destination_direction_known = False
+    if getattr(self, "_has_configured_destination", False):
+        for entity in feed_entities:
+            trip_update = entity.get("trip_update", {})
+            trip = trip_update.get("trip", {})
+            if str(trip.get("trip_id")) not in configured_trip_ids:
+                continue
+            if not route_ids_match(trip.get("route_id"), self._route_id):
+                continue
+            stop_updates = trip_update.get("stop_time_update", [])
+            stop_ids = [
+                update.get("stop_id")
+                for update in stop_updates
+            ]
+            try:
+                origin_index = stop_ids.index(self._stop_id)
+                destination_index = stop_ids.index(self._destination_id)
+            except ValueError:
+                continue
+            if origin_index < destination_index and "direction_id" in trip:
+                requested_direction = str(trip["direction_id"])
+                destination_direction_known = True
+                _LOGGER.debug(
+                    "Using realtime direction %s from origin/destination "
+                    "updates for route %s",
+                    requested_direction,
+                    self._route_id,
+                )
+                break
+        if not destination_direction_known:
+            _LOGGER.debug(
+                "No realtime trip contains both origin %s and destination %s "
+                "for route %s; retaining exact trip-ID matches",
+                self._stop_id,
+                self._destination_id,
+                self._route_id,
+            )
+
     for entity in feed_entities:
 
         if entity.get('trip_update', False):
@@ -266,8 +331,17 @@ def get_rt_route_trip_statuses(self):
                 route_id = entity["trip_update"]["trip"]["route_id"]
 
             trip_id = entity["trip_update"]["trip"]["trip_id"]
-            if route_id != str(self._route_id) and trip_id != str(self._trip_id):
-                continue  # skip direction lookup for routes we don't care about
+            trip_id_match = str(trip_id) in configured_trip_ids
+            if (
+                self._rt_group == "route"
+                and not trip_id_match
+                and not is_subway_route
+            ):
+                continue
+            if self._rt_group != "route" and trip_id != str(self._trip_id):
+                continue
+            if not route_ids_match(route_id, self._route_id):
+                continue
             if "direction_id" in entity["trip_update"]["trip"]:
                 # direction_id was explicitly present in the (converted) feed dict
                 direction_id = entity["trip_update"]["trip"]["direction_id"]
@@ -284,6 +358,7 @@ def get_rt_route_trip_statuses(self):
                     "RT feed missing direction_id for trip %s — resolved: %s",
                     trip_id, direction_id
                 )
+            direction_id = str(direction_id)
                 
             # for route-based requests, if the rt-data has no route (ex. TER) then the selection should be on matching trip_id or matching RT-id with short_name (ex. MTA Metro North RR)
             # result will be that only one RT value will be collected
@@ -293,6 +368,17 @@ def get_rt_route_trip_statuses(self):
                 
             if self._rt_group == "trip":
                 direction_id = self._direction   
+            elif trip_id_match:
+                # The static upcoming trip IDs are authoritative. Some feeds
+                # publish direction values using a different convention than
+                # the static feed, so keep matching departures under the
+                # sensor's configured direction.
+                direction_id = self._direction
+            elif is_subway_route and self._rt_group == "route":
+                # TTC subway TripUpdates use a different trip-ID namespace and
+                # omit direction_id. The origin platform identifies the
+                # configured direction, so retain the sensor's static value.
+                direction_id = self._direction
 
             entity_id = entity["id"]
             
@@ -303,18 +389,62 @@ def get_rt_route_trip_statuses(self):
             # lookup failed), treat a route_id match as sufficient for route-based
             # sensors so that departures are not silently dropped.
             direction_resolved = direction_id != "nn"
-            route_match = (route_id == self._route_id or self._route_id in route_id)
+            route_match = route_ids_match(route_id, self._route_id) or str(self._route_id) in route_id
             direction_match = (str(direction_id) == str(self._direction))
+            stop_time_updates = entity["trip_update"].get("stop_time_update", [])
+            origin_stop_match = any(
+                stop.get("stop_id") == self._stop_id
+                or (
+                    stop.get("stop_id") == ""
+                    and stop.get("stop_sequence") == self._stop_sequence
+                )
+                for stop in stop_time_updates
+            )
+            subway_trip_match = (
+                self._rt_group == "route"
+                and is_subway_route
+                and route_match
+                and origin_stop_match
+            )
 
             # first part covers start/end and thus multiple RT are possible for the same stop, also, for SIRI route_id do not match so a 'in' is used 
             # the second part covers local stops, i.e. per trip, so only one RT possible for that stop         
-            if (self._rt_group == "route" and route_match and (direction_match or (not direction_resolved and self._rt_group == "route"))) or (direction_id == "nn" and trip_id == self._trip_id) or (self._trip_id in trip_id) or (self._rt_group == "trip" and (trip_id == self._trip_id or self._trip_id in trip_id)) or entity_id == self._trip_short_name:
+            if (
+                (
+                    self._rt_group == "route"
+                    and route_match
+                    and trip_id_match
+                )
+                or subway_trip_match
+                or (direction_id == "nn" and trip_id == self._trip_id)
+                or (
+                    self._rt_group == "trip"
+                    and trip_id == self._trip_id
+                )
+                or entity_id == self._trip_short_name
+            ):
                 
                 _LOGGER.debug("Entity found params - group: %s, route_id: %s, direction_id: %s, self_trip_id: %s, with rt trip: %s, rt id: %s", self._rt_group, route_id, direction_id, self._trip_id, entity["trip_update"]["trip"], entity_id)
                 
-                for stop in entity["trip_update"]["stop_time_update"]:
+                if getattr(self, "_has_configured_destination", False):
+                    origin_sequence = self._stop_sequence
+                    destination_sequences = [
+                        update.get("stop_sequence")
+                        for update in stop_time_updates
+                        if update.get("stop_id") == self._destination_id
+                    ]
+                    if destination_sequences and origin_sequence is not None:
+                        destination_after_origin = any(
+                            sequence is None
+                            or int(sequence) > int(origin_sequence)
+                            for sequence in destination_sequences
+                        )
+                        if not destination_after_origin:
+                            continue
+
+                for stop in stop_time_updates:
                     stop_id = stop["stop_id"]
-                    stop_sequence = stop["stop_sequence"]
+                    stop_sequence = stop.get("stop_sequence", None)
                     if stop_id == self._stop_id or (stop_id == "" and stop_sequence == self._stop_sequence):
                         _LOGGER.debug("Stop found: %s", stop)
                         # if the data does not contain a stop_id but only a stop_sequence, assume stop_id being the correct stop based on sequence
@@ -343,8 +473,10 @@ def get_rt_route_trip_statuses(self):
                             departure_times[self._route_id][direction_id][stop_id]["delays"] = []
                         
                         # Use stop arrival time;
-                        # fall back on departure time if not available                            
-                        if stop["arrival"]["time"] == 0:
+                        # fall back on departure time if not available      
+                        if not stop["arrival"]:
+                            stop["arrival"] = {"time": 0, "delay": 0}          
+                        if stop["arrival"].get("time", 0) == 0:
                             stop_time = stop["departure"]["time"]
                         else:
                             stop_time = stop["arrival"]["time"]
@@ -357,6 +489,7 @@ def get_rt_route_trip_statuses(self):
                         # Ignore arrival times in the past
                         
                         if due_in_minutes(datetime.fromtimestamp(stop_time)) >= 0:
+                            self._rt_upcoming_trip_ids.add(str(trip_id))
                             departure_times[self._route_id][direction_id][
                                 stop_id
                             ]["departures"].append(datetime.utcfromtimestamp(stop_time).replace(tzinfo=dt_util.get_time_zone("UTC")))
@@ -375,14 +508,65 @@ def get_rt_route_trip_statuses(self):
                     departure_times[self._route_id][direction][stop]["departures"].sort()
 
     self.info = departure_times
+    if self._vehicle_position_url:
+        get_rt_vehicle_positions(self)
     _LOGGER.debug("Departure times Route Trip: %s", departure_times)
     return departure_times    
 
 def get_rt_vehicle_positions(self):
-    feed_entities = get_gtfs_feed_entities(
-        url=self._vehicle_position_url,
-        headers=self._headers,
-        label="vehicle_positions",
+    _cache = getattr(self, '_rt_cache', None)
+    if _cache is not None:
+        feed_entities = _cache.get_for_route(self._vehicle_position_url, self._route_id)
+        if feed_entities is None:
+            feed_entities = get_gtfs_feed_entities(
+                url=self._vehicle_position_url, headers=self._headers, label="vehicle_positions",
+                cache=_cache
+            )
+    else:
+        feed_entities = get_gtfs_feed_entities(
+            url=self._vehicle_position_url, headers=self._headers, label="vehicle_positions",
+            cache=None
+        )
+    if not feed_entities:
+        _LOGGER.debug("No vehicle position entities available for route: %s", self._route_id)
+        self.geojson = {
+            "features": [],
+            "type": "FeatureCollection",
+        }
+        return []
+    route_direction_vehicles = [
+        entity["vehicle"]
+        for entity in feed_entities
+        if entity.get("vehicle", {}).get("trip", {}).get("trip_id")
+        and route_ids_match(
+            self._route_id,
+            entity["vehicle"]["trip"].get("route_id"),
+        )
+        and (
+            not entity["vehicle"]["trip"].get("direction_id")
+            or str(self._direction)
+            == str(entity["vehicle"]["trip"].get("direction_id"))
+        )
+    ]
+    upcoming_trip_ids = {
+        str(trip_id)
+        for trip_id in getattr(self, "_rt_upcoming_trip_ids", set())
+    }
+    vehicle_trip_ids = {
+        str(vehicle["trip"]["trip_id"])
+        for vehicle in route_direction_vehicles
+    }
+    has_upcoming_trip_ids = hasattr(self, "_rt_upcoming_trip_ids")
+    matching_trip_ids = upcoming_trip_ids & vehicle_trip_ids
+    _LOGGER.debug(
+        "Vehicle matching for route %s direction %s: %s route/direction vehicles, "
+        "%s upcoming realtime IDs, %s matching trip IDs; exact filter: %s",
+        self._route_id,
+        self._direction,
+        len(route_direction_vehicles),
+        len(upcoming_trip_ids),
+        len(matching_trip_ids),
+        has_upcoming_trip_ids,
     )
     geojson_body = []
     geojson_element = {"geometry": {"coordinates":[],"type": "Point"}, "properties": {"id": "", "title": "", "trip_id": "", "route_id": "", "direction_id": "", "vehicle_id": "", "vehicle_label": ""}, "type": "Feature"}
@@ -393,23 +577,40 @@ def get_rt_vehicle_positions(self):
             # Vehicle is not in service
             continue
         if vehicle["trip"]["trip_id"] == self._trip_id: 
-            _LOGGER.debug('Adding position for TripId: %s, RouteId: %s, DirectionId: %s, Lat: %s, Lon: %s, crc_trip_id: %s', vehicle["trip"]["trip_id"],vehicle["trip"]["route_id"],vehicle["trip"]["direction_id"],vehicle["position"]["latitude"],vehicle["position"]["longitude"], binascii.crc32((vehicle["trip"]["trip_id"]).encode('utf8')))  
+            _LOGGER.debug('Adding position for TripId: %s, RouteId: %s, DirectionId: %s, Lat: %s, Lon: %s, crc_trip_id: %s', vehicle["trip"]["trip_id"],vehicle["trip"]["route_id"],vehicle["trip"].get("direction_id"),vehicle["position"]["latitude"],vehicle["position"]["longitude"], binascii.crc32((vehicle["trip"]["trip_id"]).encode('utf8')))  
             
         # add data if in the selected direction
-        if (str(self._route_id) == str(vehicle["trip"]["route_id"]) or str(vehicle["trip"]["trip_id"]) == str(self._trip_id)) and str(self._direction) == str(vehicle["trip"]["direction_id"]):
+        vehicle_direction = vehicle["trip"].get("direction_id")
+        route_direction_match = (
+            route_ids_match(self._route_id, vehicle["trip"]["route_id"])
+            and (
+                not vehicle_direction
+                or str(self._direction) == str(vehicle_direction)
+            )
+        )
+        trip_id_match = (
+            str(vehicle["trip"]["trip_id"]) in upcoming_trip_ids
+        )
+        if route_direction_match and (
+            not has_upcoming_trip_ids or trip_id_match
+        ):
             _LOGGER.debug("Found vehicle on route with attributes: %s", vehicle)
             _LOGGER.debug("crc : %s", binascii.crc32((vehicle["trip"]["trip_id"]).encode('utf8')))
             geojson_element = {"geometry": {"coordinates":[],"type": "Point"}, "properties": {"id": "", "title": "", "trip_id": "", "route_id": "", "direction_id": "", "vehicle_id": "", "vehicle_label": ""}, "type": "Feature"}
             geojson_element["geometry"]["coordinates"] = []
             geojson_element["geometry"]["coordinates"].append(vehicle["position"]["longitude"])
             geojson_element["geometry"]["coordinates"].append(vehicle["position"]["latitude"])
-            geojson_element["properties"]["id"] = str(self._route_id) + "(" + str(vehicle["trip"]["direction_id"]) + ")" + str(binascii.crc32((vehicle["trip"]["trip_id"]).encode('utf8')))[-3:]
-            geojson_element["properties"]["title"] = str(self._route_id) + "(" + str(vehicle["trip"]["direction_id"]) + ")" + str(binascii.crc32((vehicle["trip"]["trip_id"]).encode('utf8')))[-3:] + "_" + self._icon.split(':')[1]
+            display_direction = vehicle_direction or self._direction
+            geojson_element["properties"]["id"] = str(self._route_id) + "(" + str(display_direction) + ")" + str(binascii.crc32((vehicle["trip"]["trip_id"]).encode('utf8')))[-3:]
+            geojson_element["properties"]["title"] = str(self._route_id) + "(" + str(display_direction) + ")" + str(binascii.crc32((vehicle["trip"]["trip_id"]).encode('utf8')))[-3:] + "_" + self._icon.split(':')[1]
             geojson_element["properties"]["trip_id"] = vehicle["trip"]["trip_id"]
             geojson_element["properties"]["route_id"] = str(self._route_id)
-            geojson_element["properties"]["direction_id"] = vehicle["trip"]["direction_id"]
+            geojson_element["properties"]["direction_id"] = display_direction
             geojson_element["properties"]["vehicle_id"] = vehicle["vehicle"]["id"]
             geojson_element["properties"]["vehicle_label"] = vehicle["vehicle"]["label"]
+            geojson_element["properties"]["occupancy_status"] = vehicle.get(
+                "occupancy_status"
+            )
             geojson_element["properties"][vehicle["trip"]["trip_id"]] = geojson_element["geometry"]["coordinates"]
             geojson_body.append(geojson_element)
     
@@ -429,33 +630,36 @@ def get_rt_alerts(self):
         url=self._alerts_url,
         headers=self._headers,
         label="alerts",
+        cache=getattr(self, '_rt_cache', None)
     )
     if not feed_entities:
         return rt_alerts
 
+    # Detect feed format — protobuf objects have HasField, dicts don't
+    if not hasattr(feed_entities[0], 'HasField'):
+        return get_rt_alerts_json(self)
+
     for entity in feed_entities:
         if entity.HasField("alert"):
             # Extract alert text cleanly rather than string-splitting the proto repr
-            alert_text = ""
+            alert_header = ""
+            alert_desc = ""
+            try:
+                alert_header = entity.alert.header_text.translation[0].text
+            except (IndexError, AttributeError):
+                pass
             try:
                 # Use description_text for the full message; fall back to
                 # header_text if description is absent (e.g. some feeds omit it)
                 desc = entity.alert.description_text.translation
-                alert_text = desc[0].text if desc else ""
+                alert_desc = desc[0].text if desc else ""
             except (IndexError, AttributeError):
                 pass
-            if not alert_text:
-                try:
-                    alert_text = entity.alert.header_text.translation[0].text
-                except (IndexError, AttributeError):
-                    pass
-
+            alert_text = alert_header + " " + alert_desc if alert_desc != "" else alert_header
             # Evaluate each informed_entity independently so alerts covering
             # multiple routes/stops are not filtered down to just the last one.
-            # Bug fix: the original code checked HasField("stop_id") for both
-            # stop_id AND route_id (copy-paste error), causing route_id to always
-            # resolve to "unknown" when stop_id was absent (e.g. route-only alerts
-            # like TTC subway detours), and then never matching self._route_id.
+            # Route-only alerts (no stop_id, e.g. TTC subway detours) must still
+            # resolve their route_id from the informed entity.
             for x in entity.alert.informed_entity:
                 try:
                     stop_id = x.stop_id if x.HasField("stop_id") else "unknown"
@@ -472,13 +676,21 @@ def get_rt_alerts(self):
                 if stop_id == self._stop_id and (route_id == "unknown" or route_id == self._route_id):
                     _LOGGER.debug("RT Alert matched origin stop for route: %s, stop: %s", route_id, stop_id)
                     rt_alerts["origin_stop_alert"] = alert_text
+                    rt_alerts["origin_stop_alert_header"] = alert_header
+                    rt_alerts["origin_stop_alert_desc"] = alert_desc
                 if stop_id == self._destination_id and (route_id == "unknown" or route_id == self._route_id):
                     _LOGGER.debug("RT Alert matched destination stop for route: %s, stop: %s", route_id, stop_id)
                     rt_alerts["destination_stop_alert"] = alert_text
+                    rt_alerts["destination_stop_alert_header"] = alert_header
+                    rt_alerts["destination_stop_alert_desc"] = alert_desc
                 if route_id == self._route_id:
                     _LOGGER.debug("RT Alert matched route (no stop filter) for route: %s", route_id)
                     rt_alerts["origin_stop_alert"] = alert_text
+                    rt_alerts["origin_stop_alert_header"] = alert_header
+                    rt_alerts["origin_stop_alert_desc"] = alert_desc
                     rt_alerts["destination_stop_alert"] = alert_text
+                    rt_alerts["destination_stop_alert_header"] = alert_header
+                    rt_alerts["destination_stop_alert_desc"] = alert_desc
 
     return rt_alerts
     
@@ -491,6 +703,7 @@ def get_rt_alerts_json(self):
         url=self._alerts_url,
         headers=self._headers,
         label="alerts",
+        cache=getattr(self, '_rt_cache', None)
     )
 
     if not feed_entities:
@@ -499,15 +712,17 @@ def get_rt_alerts_json(self):
     for entity in feed_entities:
         alert = entity.get("alert")
         if alert:
+
+            _translations = alert.get("header_text", {}).get("translation", [])
+            alert_header = _translations[0].get("text", "") if _translations else ""
             # Use description_text for the full message; fall back to header_text
             _translations = alert.get("description_text", {}).get("translation", [])
-            alert_text = _translations[0].get("text", "") if _translations else ""
-            if not alert_text:
-                _translations = alert.get("header_text", {}).get("translation", [])
-                alert_text = _translations[0].get("text", "") if _translations else ""
+            alert_desc = _translations[0].get("text", "") if _translations else ""
+            alert_text = alert_header + " " + alert_desc if alert_desc != "" else alert_header
 
-            # Evaluate each informed_entity independently — same bug fix as
-            # get_rt_alerts: loop over all entities and match inside the loop.
+
+            # Evaluate each informed_entity independently (as in get_rt_alerts):
+            # loop over all entities and match inside the loop.
             for x in alert.get("informed_entity", []):
                 stop_id = x.get("stop_id") or "unknown"
                 route_id = x.get("route_id") or "unknown"
@@ -518,13 +733,21 @@ def get_rt_alerts_json(self):
                 if stop_id == self._stop_id and (route_id == "unknown" or route_id == self._route_id):
                     _LOGGER.debug("RT Alert JSON matched origin stop for route: %s, stop: %s", route_id, stop_id)
                     rt_alerts["origin_stop_alert"] = alert_text
+                    rt_alerts["origin_stop_alert_header"] = alert_header
+                    rt_alerts["origin_stop_alert_desc"] = alert_desc
                 if stop_id == self._destination_id and (route_id == "unknown" or route_id == self._route_id):
                     _LOGGER.debug("RT Alert JSON matched destination stop for route: %s, stop: %s", route_id, stop_id)
                     rt_alerts["destination_stop_alert"] = alert_text
+                    rt_alerts["destination_stop_alert_header"] = alert_header
+                    rt_alerts["destination_stop_alert_desc"] = alert_desc
                 if route_id == self._route_id:
                     _LOGGER.debug("RT Alert JSON matched route (no stop filter) for route: %s", route_id)
                     rt_alerts["origin_stop_alert"] = alert_text
+                    rt_alerts["origin_stop_alert_header"] = alert_header
+                    rt_alerts["origin_stop_alert_desc"] = alert_desc
                     rt_alerts["destination_stop_alert"] = alert_text
+                    rt_alerts["destination_stop_alert_header"] = alert_header
+                    rt_alerts["destination_stop_alert_desc"] = alert_desc
 
     return rt_alerts
     
@@ -539,7 +762,7 @@ def update_geojson(self):
     
 def get_gtfs_rt(hass, path, data):
     """Get gtfs rt data."""
-    _LOGGER.debug("Getting gtfs rt locally with data: %s", data)
+    _LOGGER.debug("Getting gtfs rt locally with data: %s", Redacted(data))
     _headers = data.get('headers','')
     _source_format = data.get('source_format',None)                                                  
     gtfs_dir = hass.config.path(path)
@@ -553,10 +776,10 @@ def get_gtfs_rt(hass, path, data):
         _headers = {data[CONF_API_KEY_NAME]: data[CONF_API_KEY]}
         if data.get(CONF_ACCEPT_HEADER_PB, False):
             _headers["Accept"] = "application/x-protobuf"
-    _LOGGER.debug("Getting gtfs rt locally with headers: %s", _headers)
+    _LOGGER.debug("Getting gtfs rt locally with headers: %s", Redacted(_headers))
     
     if data.get('entity_for_siri',None):
-        _LOGGER.debug("Getting siri RT departures with data: %s", data)
+        _LOGGER.debug("Getting siri RT departures with data: %s", Redacted(data))
         entity_registry = er.async_get(hass)
         entity = er.async_get(hass).async_get(data["entity_for_siri"])
         _LOGGER.debug("entity: %s", entity)
@@ -566,16 +789,11 @@ def get_gtfs_rt(hass, path, data):
         cf_options = config_entry.options
         _stop_id = cf_data["origin"].split(':')[0]
         _LOGGER.debug("_stop_id: %s", _stop_id)
-        _LOGGER.debug("config entry data: %s, options: %s", cf_data, cf_options)
+        _LOGGER.debug("config entry data: %s, options: %s", Redacted(cf_data), Redacted(cf_options))
         file = data["file"] + "_rt.json"
-        #try:
         r = convert_realtime_siri_trips_to_json(url,_headers,_stop_id)
         open(os.path.join(gtfs_dir, file), "w").write(json.dumps(r))
         return "ok"
-        #except Exception as ex:  # pylint: disable=broad-except
-        #    _LOGGER.error("Ìssues with downloading GTFS RT SIRI data to: %s with error: 5s", os.path.join(gtfs_dir, file), ex)
-        #    return "no_rt_data_file" 
-        return "ok"                                
     try:
         r = requests.get(url, headers = _headers , allow_redirects=True)
         open(os.path.join(gtfs_dir, file), "wb").write(r.content)
@@ -594,6 +812,7 @@ def get_gtfs_rt(hass, path, data):
                 url=data.get("url", None),
                 headers=_headers,
                 label=data.get("rt_type", "-"),
+                cache=getattr(self, '_rt_cache', None)
             )  
             file_all = data["file"] + "_converted.txt"
             # check if content is json else write without format            
@@ -691,13 +910,32 @@ def convert_gtfs_realtime_positions_to_json(gtfs_realtime_data):
     }
     for ent in feed.entity:
         entity = ent.vehicle
+        trip_dict = {
+            "trip_id": entity.trip.trip_id,
+            "route_id": entity.trip.route_id,
+        }
+        try:
+            if entity.trip.HasField("direction_id"):
+                trip_dict["direction_id"] = entity.trip.direction_id
+        except ValueError:
+            if entity.trip.direction_id:
+                trip_dict["direction_id"] = entity.trip.direction_id
+
+        occupancy_status = None
+        try:
+            if entity.HasField("occupancy_status"):
+                occupancy_field = entity.DESCRIPTOR.fields_by_name[
+                    "occupancy_status"
+                ]
+                occupancy_status = occupancy_field.enum_type.values_by_number[
+                    entity.occupancy_status
+                ].name
+        except (AttributeError, KeyError, ValueError):
+            pass
+
         entity_dict = {
         "vehicle": {
-            "trip": {
-                "trip_id" : entity.trip.trip_id,
-                "route_id": entity.trip.route_id,
-                "direction_id": entity.trip.direction_id
-                },
+            "trip": trip_dict,
             "vehicle": {
                 "id": entity.vehicle.id,
                 "label": entity.vehicle.label
@@ -709,7 +947,8 @@ def convert_gtfs_realtime_positions_to_json(gtfs_realtime_data):
                 "speed": entity.position.speed
             },
             "stop_id": entity.stop_id,
-            "timestamp": entity.timestamp
+            "timestamp": entity.timestamp,
+            "occupancy_status": occupancy_status,
         }
         }
         json_data["entity"].append(entity_dict)

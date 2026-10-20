@@ -4,13 +4,14 @@ from homeassistant.const import CONF_OFFSET, STATE_UNKNOWN, Platform
 DOMAIN = "gtfs2"
 
 # default values for options
-DEFAULT_REFRESH_INTERVAL = 15
+DEFAULT_REFRESH_INTERVAL = 60
 DEFAULT_OFFSET = 0
-DEFAULT_LOCAL_STOP_REFRESH_INTERVAL = 15
+DEFAULT_LOCAL_STOP_REFRESH_INTERVAL = 60
 DEFAULT_LOCAL_STOP_TIMERANGE = 30
 DEFAULT_LOCAL_STOP_TIMERANGE_HISTORY = 15
 DEFAULT_LOCAL_STOP_RADIUS = 200
 DEFAULT_MAX_LOCAL_STOPS = 15
+DEFAULT_VEHICLE_SLOTS = 0
 
 DEFAULT_NAME = "GTFS Sensor2"
 DEFAULT_PATH = "gtfs2"
@@ -23,7 +24,7 @@ CONF_DESTINATION = "destination"
 CONF_ORIGIN = "origin"
 CONF_TOMORROW = "include_tomorrow"
 
-PLATFORMS = [Platform.SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.DEVICE_TRACKER]
 
 # constants used in helpers
 ATTR_API_KEY_LOCATIONS = ["not_applicable","header","query_string"]
@@ -290,6 +291,7 @@ CONF_OFFSET = "offset"
 CONF_REAL_TIME = "real_time"
 CONF_SOURCE_TIMEZONE_CORRECTION = "source_timezone_correction"
 CONF_MAX_LOCAL_STOPS = "max_local_stops"
+CONF_VEHICLE_SLOTS = "vehicle_slots"
 
 # gtfs_rt specific
 CONF_API_KEY = "api_key"
@@ -310,5 +312,3 @@ DEFAULT_DIRECTION = "0"
 DEFAULT_API_KEY_NAME = "api_key"
 
 TIME_STR_FORMAT = "%H:%M"
-
-

@@ -49,7 +49,9 @@ from .const import (
     CONF_REAL_TIME,
     ATTR_API_KEY_LOCATIONS,
     DEFAULT_MAX_LOCAL_STOPS,
-    CONF_MAX_LOCAL_STOPS
+    CONF_MAX_LOCAL_STOPS,
+    DEFAULT_VEHICLE_SLOTS,
+    CONF_VEHICLE_SLOTS,
 )    
 
 from .gtfs_helper import (
@@ -63,6 +65,8 @@ from .gtfs_helper import (
     get_agency_list,
     get_local_stop_list
 )
+
+from .redact import Redacted
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -117,7 +121,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input[CONF_URL] = "na"
         user_input[CONF_EXTRACT_FROM] = "zip"
         self._user_inputs.update(user_input)
-        _LOGGER.debug(f"UserInputs Start End: {self._user_inputs}")
+        _LOGGER.debug("UserInputs Start End: %s", Redacted(self._user_inputs))
         return await self.async_step_agency()            
             
     async def async_step_local_stops(self, user_input: dict | None = None) -> FlowResult:
@@ -141,7 +145,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input[CONF_URL] = "na"
         user_input[CONF_EXTRACT_FROM] = "zip"    
         self._user_inputs.update(user_input)
-        _LOGGER.debug(f"UserInputs Local Stops: {self._user_inputs}") 
+        _LOGGER.debug("UserInputs Local Stops: %s", Redacted(self._user_inputs)) 
         check_data = await self._check_data(self._user_inputs)
         if check_data :
             errors["base"] = check_data
@@ -191,7 +195,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_abort(reason=check_data, description_placeholders=TRANSLATION_DESCRIPTION_PLACEHOLDERS)
         else:
             self._user_inputs.update(user_input)
-            _LOGGER.debug(f"UserInputs Source: {self._user_inputs}")
+            _LOGGER.debug("UserInputs Source: %s", Redacted(self._user_inputs))
             return await self.async_step_agency()            
 
     async def async_step_remove(self, user_input: dict | None = None) -> FlowResult:
@@ -259,7 +263,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             user_input = {}
             user_input[CONF_AGENCY] = "0: ALL"
         self._user_inputs.update(user_input)
-        _LOGGER.debug(f"UserInputs Agency: {self._user_inputs}")
+        _LOGGER.debug("UserInputs Agency: %s", Redacted(self._user_inputs))
         return await self.async_step_route_type()          
         
     async def async_step_route_type(self, user_input: dict | None = None) -> FlowResult:
@@ -277,7 +281,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors=errors,
             )                
         self._user_inputs.update(user_input)
-        _LOGGER.debug(f"UserInputs Route Type: {self._user_inputs}")
+        _LOGGER.debug("UserInputs Route Type: %s", Redacted(self._user_inputs))
         if user_input[CONF_ROUTE_TYPE] == "2":
             return await self.async_step_stops_train()
         else:
@@ -287,7 +291,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Handle the route and reset the route_type to the proper one."""
         errors: dict[str, str] = {}
         check_data = await self._check_data(self._user_inputs)
-        _LOGGER.debug("Source check data: %s", check_data)
+        _LOGGER.debug("Source check data: %s", Redacted(check_data))
         if check_data :
             errors["base"] = check_data
             return self.async_abort(reason=check_data)
@@ -324,7 +328,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         user_input[CONF_ROUTE] = user_input.get(CONF_ROUTE).split('##')[1].split(": (")[0]   
                
         self._user_inputs.update(user_input)
-        _LOGGER.debug(f"UserInputs Route: {self._user_inputs}")
+        _LOGGER.debug("UserInputs Route: %s", Redacted(self._user_inputs))
         return await self.async_step_stops()
 
     async def async_step_stops(self, user_input: dict | None = None) -> FlowResult:
@@ -337,13 +341,20 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._user_inputs[CONF_ROUTE],
                     self._user_inputs[CONF_DIRECTION],
                 )
-                last_stop = stops[-1:][0]
+                destination_options = [
+                    selector.SelectOptionDict(value="", label="Final stop (automatic)")
+                ] + [
+                    selector.SelectOptionDict(value=stop, label=stop)
+                    for stop in stops
+                ]
                 return self.async_show_form(
                     step_id="stops",
                     data_schema=vol.Schema(
                         {
                             vol.Required(CONF_ORIGIN): vol.In(stops),
-                            vol.Required(CONF_DESTINATION, default=last_stop): vol.In(stops),
+                            vol.Optional(CONF_DESTINATION, default=""): selector.SelectSelector(
+                                selector.SelectSelectorConfig(options=destination_options)
+                            ),
                             vol.Required(CONF_NAME): str,
                             vol.Optional(CONF_INCLUDE_TOMORROW, default = False): selector.BooleanSelector(),
                         },
@@ -357,11 +368,20 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 
         # when train route-type, use the names of the selected stops       
         if self._user_inputs[CONF_ROUTE_TYPE] == '2':
-            user_input[CONF_ORIGIN] = user_input.get(CONF_ORIGIN).split(': ')[1].split(" (")[0] 
-            user_input[CONF_DESTINATION] = user_input.get(CONF_DESTINATION).split(': ')[1].split(" (")[0]  
+            user_input[CONF_ORIGIN] = user_input.get(CONF_ORIGIN).split(': ')[1].split(" (")[0]
+            dest = user_input.get(CONF_DESTINATION, '')
+            user_input[CONF_DESTINATION] = dest.split(': ')[1].split(" (")[0] if dest else ''
+        else:
+            user_input[CONF_ORIGIN] = user_input[CONF_ORIGIN].split(': ', 1)[0]
+            dest = user_input.get(CONF_DESTINATION, '')
+            user_input[CONF_DESTINATION] = dest.split(': ', 1)[0] if dest else ''
             
         self._user_inputs.update(user_input)
-        _LOGGER.debug(f"UserInputs Stops: {self._user_inputs}")
+        if self._user_inputs[CONF_ROUTE_TYPE] != '2':
+            self._user_inputs[CONF_ORIGIN] = self._user_inputs[CONF_ORIGIN].split(': ', 1)[0]
+            dest = self._user_inputs.get(CONF_DESTINATION, '')
+            self._user_inputs[CONF_DESTINATION] = dest.split(': ', 1)[0] if dest else ''
+        _LOGGER.debug("UserInputs Stops: %s", Redacted(self._user_inputs))
         check_config = await self._check_config(self._user_inputs)
         if check_config:
             return await self.async_step_stops_retry()
@@ -380,13 +400,23 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._user_inputs[CONF_ROUTE],
                     self._user_inputs[CONF_DIRECTION],
                 )
-                last_stop = stops[-1:][0]
+                destination_options = [
+                    selector.SelectOptionDict(value="", label="Final stop (automatic)")
+                ] + [
+                    selector.SelectOptionDict(value=stop, label=stop)
+                    for stop in stops
+                ]
                 return self.async_show_form(
                     step_id="stops_retry",
                     data_schema=vol.Schema(
                         {
                             vol.Required(CONF_ORIGIN, default = self._user_inputs[CONF_ORIGIN]): vol.In(stops),
-                            vol.Required(CONF_DESTINATION, default = self._user_inputs[CONF_DESTINATION]): vol.In(stops),
+                            vol.Optional(
+                                CONF_DESTINATION,
+                                default=self._user_inputs.get(CONF_DESTINATION, ""),
+                            ): selector.SelectSelector(
+                                selector.SelectSelectorConfig(options=destination_options)
+                            ),
                             vol.Required(CONF_NAME): str,
                             vol.Optional(CONF_INCLUDE_TOMORROW, default = False): selector.BooleanSelector(),
                         },
@@ -398,7 +428,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 _LOGGER.debug(f"Likely no stops for this route: {[CONF_ROUTE]}")
                 return self.async_abort(reason="no_stops")
         self._user_inputs.update(user_input)
-        _LOGGER.debug(f"UserInputs Stops: {self._user_inputs}")
+        _LOGGER.debug("UserInputs Stops: %s", Redacted(self._user_inputs))
         check_config = await self._check_config(self._user_inputs)
         if check_config:
             return await self.async_step_stops_retry()
@@ -416,7 +446,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data_schema=vol.Schema(
                     {
                         vol.Required(CONF_ORIGIN): str,
-                        vol.Required(CONF_DESTINATION): str,
+                        vol.Optional(CONF_DESTINATION, default=""): str,
                         vol.Required(CONF_NAME): str,
                         vol.Optional(CONF_INCLUDE_TOMORROW, default = False): selector.BooleanSelector(),
                     },
@@ -427,10 +457,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._user_inputs.update(user_input)
         self._user_inputs[CONF_DIRECTION] = 0
         self._user_inputs[CONF_ROUTE] = "train"
-        _LOGGER.debug(f"UserInputs Stops Train: {self._user_inputs}")
+        _LOGGER.debug("UserInputs Stops Train: %s", Redacted(self._user_inputs))
         check_config = await self._check_config(self._user_inputs)
         if check_config:
-            _LOGGER.debug(f"CheckConfig: {check_config}")
+            _LOGGER.debug("CheckConfig: %s", Redacted(check_config))
             errors["base"] = check_config
             return self.async_abort(reason=check_config)
         else:
@@ -448,7 +478,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._pygtfs = await self.hass.async_add_executor_job(
             get_gtfs, self.hass, DEFAULT_PATH, data, False
         )
-        _LOGGER.debug("Checkdata pygtfs: %s with data: %s", self._pygtfs, data)
+        _LOGGER.debug("Checkdata pygtfs: %s with data: %s", self._pygtfs, Redacted(data))
         if self._pygtfs in ['no_data_file', 'no_zip_file', 'extracting'] :
             return self._pygtfs
         check_index = await self.hass.async_add_executor_job(
@@ -471,14 +501,16 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._data = {
             "schedule": self._pygtfs,
             "origin": data["origin"],
-            "destination": data["destination"],
+            "destination": data.get("destination", ""),
             "offset": 0,
-            "include_tomorrow": True,
+            "include_tomorrow": bool(data.get(CONF_INCLUDE_TOMORROW, False)),
             "gtfs_dir": DEFAULT_PATH,
             "name": data["name"],
             "next_departure": None,
             "file": data["file"],
-            "route_type": data["route_type"]
+            "route_type": data["route_type"],
+            "route": data.get("route", ""),
+            "direction": str(data.get("direction", "")),
         }
         # check and/or add indexes
         check_index = await self.hass.async_add_executor_job(
@@ -532,11 +564,11 @@ class GTFSOptionsFlowHandler(config_entries.OptionsFlow):
                     return self.async_abort(reason=stop_limit) 
             if user_input.get(CONF_REAL_TIME,None):
                 self._user_inputs.update(user_input)
-                _LOGGER.debug(f"UserInputs Options Init with realtime: {self._user_inputs}")
+                _LOGGER.debug("UserInputs Options Init with realtime: %s", Redacted(self._user_inputs))
                 return await self.async_step_real_time()    
             else: 
                 self._user_inputs.update(user_input)
-                _LOGGER.debug(f"UserInputs Options Init without realtime: {self._user_inputs}")
+                _LOGGER.debug("UserInputs Options Init without realtime: %s", Redacted(self._user_inputs))
                 return self.async_create_entry(title="", data=self._user_inputs)
         
         if self.config_entry.data.get(CONF_DEVICE_TRACKER_ID, None):
@@ -574,7 +606,7 @@ class GTFSOptionsFlowHandler(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             self._user_inputs.update(user_input)
-            _LOGGER.debug(f"UserInput Realtime: {self._user_inputs}")
+            _LOGGER.debug("UserInput Realtime: %s", Redacted(self._user_inputs))
             return self.async_create_entry(title="", data=self._user_inputs)
 
         if self.config_entry.data.get(CONF_DEVICE_TRACKER_ID, None):
@@ -604,6 +636,7 @@ class GTFSOptionsFlowHandler(config_entries.OptionsFlow):
                         vol.Optional(CONF_TRIP_UPDATE_URL, default=self.config_entry.options.get(CONF_TRIP_UPDATE_URL, "")): str,
                         vol.Optional(CONF_VEHICLE_POSITION_URL, default=self.config_entry.options.get(CONF_VEHICLE_POSITION_URL,"")): str,
                         vol.Optional(CONF_ALERTS_URL, default=self.config_entry.options.get(CONF_ALERTS_URL,"")): cv.string,
+                        vol.Optional(CONF_VEHICLE_SLOTS, default=self.config_entry.options.get(CONF_VEHICLE_SLOTS, DEFAULT_VEHICLE_SLOTS)): vol.All(vol.Coerce(int), vol.Range(min=0, max=20)),
                         vol.Optional(CONF_API_KEY, default=self.config_entry.options.get(CONF_API_KEY, '')) : cv.string,
                         vol.Optional(CONF_API_KEY_NAME, default=self.config_entry.options.get(CONF_API_KEY_NAME,DEFAULT_API_KEY_NAME)) : cv.string,
                         vol.Required(CONF_API_KEY_LOCATION, default=self.config_entry.options.get(CONF_API_KEY_LOCATION,DEFAULT_API_KEY_LOCATION)) : selector.SelectSelector(selector.SelectSelectorConfig(options=ATTR_API_KEY_LOCATIONS, translation_key="api_key_location")),
@@ -615,7 +648,7 @@ class GTFSOptionsFlowHandler(config_entries.OptionsFlow):
             )      
     
 async def _check_stop_list(self, data):
-    _LOGGER.debug("Checkstops option with data: %s", data)
+    _LOGGER.debug("Checkstops option with data: %s", Redacted(data))
     if self._pygtfs and hasattr(self._pygtfs, 'session'):
         try:
             self._pygtfs.session.close()
