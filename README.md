@@ -15,7 +15,11 @@
 - Allows to load/update/delete datasources in gtfs2 folder from the GUI
 - translations: English, French, German, Spanish, Portuguese
 
-**[Documentation](https://github.com/vingerha/gtfs2/wiki)**
+## About this fork
+
+This is a fork of [vingerha/gtfs2](https://github.com/vingerha/gtfs2) aimed at making real-time transit data less taxing, especially for large multi-route feeds, by using fewer calls. It changes real-time handling (direction ID lookups, alert matching, route filtering), shares a single background-fetched real-time feed cache (refreshed every 30 seconds) between sensors that use the same feed, resolves direction IDs against the static schedule when a feed omits them, and cuts recorder database growth. It also bundles three Lovelace cards, loaded automatically by the integration: `custom:public-transit-card`, `custom:gtfs-departures-card` and `custom:gtfs-alerts-ticker`. All credit for the original integration goes to [vingerha](https://github.com/vingerha).
+
+**[Documentation](https://github.com/vingerha/gtfs2/wiki)** (original project)
 
 ![image](https://github.com/vingerha/gtfs2/assets/44190435/401d3f5b-c3c3-405f-ab9a-1ecf949d5428)
 
