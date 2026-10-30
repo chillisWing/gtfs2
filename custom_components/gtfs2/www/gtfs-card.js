@@ -497,10 +497,14 @@ class PublicTransitCard extends HTMLElement {
             .filter(([full]) => full && String(full).toLowerCase() !== 'no info')
             .filter(([full]) => !alertExclusionsForBadge.some(k =>
               String(full).toLowerCase().includes(k)))
-            .map(([full, header]) =>
-              header && String(header).trim() && String(header).toLowerCase() !== 'no info'
-                ? header
-                : full)
+            .map(([full, header]) => {
+              const hasHeader = header && String(header).trim() && String(header).toLowerCase() !== 'no info';
+              if (!hasHeader) return full;
+              // If the description wholly contains the title, the title adds
+              // nothing — show the (more informative) description instead.
+              const norm = s => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
+              return norm(full).includes(norm(header)) ? full : header;
+            })
         : [];
       // Alerts feeding the footer list are only surfaced if the footer is
       // actually enabled; the "!" badge in the row's top-right corner uses
