@@ -4,6 +4,34 @@
 // render() rebuilding the shadow DOM on every tracked-entity change.
 const expandedAlertsState = new Map();
 
+// Alerts for one gtfs2 sensor as [{text, header, description}]. Prefers the
+// `alerts` attribute (every matching alert); falls back to the single
+// origin/destination keys when the sensor doesn't expose `alerts` (older
+// backend, or a sensor that hasn't reloaded yet).
+const gtfsCardAlerts = (a) => {
+  const valid = v => v && String(v).trim() && String(v).toLowerCase() !== 'no info';
+  if (Array.isArray(a.alerts)) {
+    return a.alerts
+      .map(x => ({
+        text: String(x?.text ?? ''),
+        header: String(x?.header ?? ''),
+        description: String(x?.description ?? ''),
+      }))
+      .filter(x => valid(x.text));
+  }
+  const out = [];
+  for (const k of ['origin', 'destination']) {
+    const text = a[`${k}_stop_alert`];
+    if (!valid(text) || out.some(x => x.text === String(text))) continue;
+    out.push({
+      text: String(text),
+      header: String(a[`${k}_stop_alert_header`] ?? ''),
+      description: String(a[`${k}_stop_alert_desc`] ?? ''),
+    });
+  }
+  return out;
+};
+
 class PublicTransitCard extends HTMLElement {
 
   setConfig(config) {
@@ -397,8 +425,9 @@ class PublicTransitCard extends HTMLElement {
       // absolutely in the top-right corner of the route row (see
       // .badge-alert CSS), independent of the flex layout, so its presence
       // never shifts the time or occupancy icon.
-      const alertRawForBadge = [a.origin_stop_alert, a.destination_stop_alert]
-        .filter(v => v && v.toLowerCase() !== 'no info')
+      const routeAlerts = gtfsCardAlerts(a);
+      const alertRawForBadge = routeAlerts
+        .map(x => x.text)
         .filter((v, i, arr) => arr.indexOf(v) === i);
       const alertExclusionsForBadge = [
         ...globalAlertExclusions,
@@ -487,23 +516,23 @@ class PublicTransitCard extends HTMLElement {
 
       // Footer shows only the short alert headers. Exclusion keywords are still
       // matched against the full alert text, so existing filters keep working.
-      // If a header is missing, it falls back to the full alert so nothing
-      // silently disappears.
+      // If a header is missing, it falls back to the description; if the
+      // description is missing, the header is shown on its own.
       const footerAlerts = (showAlerts && showAlertDetails)
-        ? [
-            [a.origin_stop_alert_desc,      a.origin_stop_alert_header],
-            [a.destination_stop_alert_desc, a.destination_stop_alert_header],
-          ]
-            .filter(([full]) => full && String(full).toLowerCase() !== 'no info')
-            .filter(([full]) => !alertExclusionsForBadge.some(k =>
-              String(full).toLowerCase().includes(k)))
-            .map(([full, header]) => {
-              const hasHeader = header && String(header).trim() && String(header).toLowerCase() !== 'no info';
-              if (!hasHeader) return full;
+        ? routeAlerts
+            .filter(x => !alertExclusionsForBadge.some(k =>
+              x.text.toLowerCase().includes(k)))
+            .map(x => {
+              const header = x.header.trim();
+              const desc = x.description.trim();
+              const hasHeader = header && header.toLowerCase() !== 'no info';
+              const hasDesc = desc && desc.toLowerCase() !== 'no info';
+              if (!hasHeader) return hasDesc ? desc : x.text;
+              if (!hasDesc) return header;
               // If the description wholly contains the title, the title adds
               // nothing — show the (more informative) description instead.
               const norm = s => String(s).replace(/\s+/g, ' ').trim().toLowerCase();
-              return norm(full).includes(norm(header)) ? full : header;
+              return norm(desc).includes(norm(header)) ? desc : header;
             })
         : [];
       // Alerts feeding the footer list are only surfaced if the footer is

@@ -39,6 +39,33 @@ const escDepartures = (value) => String(value ?? '')
 const safeHexColor = (value, fallback) =>
   /^[0-9a-f]{3,8}$/i.test(String(value ?? '')) ? '#' + value : fallback;
 
+// Alerts for one gtfs2 sensor as [{text, header, description}]. Prefers the
+// `alerts` attribute (every matching alert); falls back to the single
+// origin/destination keys when the sensor doesn't expose `alerts`.
+const gtfsDeparturesAlerts = (a) => {
+  const valid = v => v && String(v).trim() && String(v).toLowerCase() !== 'no info';
+  if (Array.isArray(a.alerts)) {
+    return a.alerts
+      .map(x => ({
+        text: String(x?.text ?? ''),
+        header: String(x?.header ?? ''),
+        description: String(x?.description ?? ''),
+      }))
+      .filter(x => valid(x.text));
+  }
+  const out = [];
+  for (const k of ['origin', 'destination']) {
+    const text = a[`${k}_stop_alert`];
+    if (!valid(text) || out.some(x => x.text === String(text))) continue;
+    out.push({
+      text: String(text),
+      header: String(a[`${k}_stop_alert_header`] ?? ''),
+      description: String(a[`${k}_stop_alert_desc`] ?? ''),
+    });
+  }
+  return out;
+};
+
 class GtfsDeparturesCard extends HTMLElement {
 
   setConfig(config) {
@@ -130,8 +157,8 @@ class GtfsDeparturesCard extends HTMLElement {
       if (!ent || ent.state === 'unavailable' || ent.state === 'unknown') continue;
 
       const a = ent.attributes;
-      const alertRaw = [a.origin_stop_alert, a.destination_stop_alert]
-        .filter(v => v && String(v).toLowerCase() !== 'no info')
+      const alertRaw = gtfsDeparturesAlerts(a)
+        .map(x => x.text)
         .filter((v, i, arr) => arr.indexOf(v) === i);
       const alertExclusions = [
         ...globalAlertExclusions,
@@ -262,7 +289,7 @@ class GtfsDeparturesCard extends HTMLElement {
         rows.push({
           dep, isRt, isLast, mins, rawDest, routeShort, routeLong,
           routeColor, routeText, stops, tripAlert,
-          alertText: visibleAlerts.join(' · '), r, rowKey
+          alertTexts: visibleAlerts, r, rowKey
         });
       }
     }
@@ -313,7 +340,7 @@ class GtfsDeparturesCard extends HTMLElement {
             <span class="status-badges">${badges}</span>
           </td>
         </tr>
-        ${row.tripAlert ? `<tr class="alert-details-row" data-row-key="${row.rowKey}" ${isExpanded ? '' : 'hidden'}><td colspan="4"><div class="alert-details"><span class="alert-icon">⚠</span>${escDepartures(row.alertText)}</div></td></tr>` : ''}`;
+        ${row.tripAlert ? `<tr class="alert-details-row" data-row-key="${row.rowKey}" ${isExpanded ? '' : 'hidden'}><td colspan="4"><div class="alert-details">${row.alertTexts.map(t => `<div class="alert-line"><span class="alert-icon">⚠</span>${escDepartures(t)}</div>`).join('')}</div></td></tr>` : ''}`;
     }).join('') : `
         <tr><td colspan="4" class="no-deps">No upcoming departures</td></tr>`;
 
@@ -425,6 +452,7 @@ class GtfsDeparturesCard extends HTMLElement {
           line-height: 1.4;
         }
         .alert-details .alert-icon { margin-right: 6px; }
+        .alert-line + .alert-line { margin-top: 6px; }
 
         /* Highlight upcoming */
         .dep-row.soon  { background: rgba(255,200,50,0.03); }

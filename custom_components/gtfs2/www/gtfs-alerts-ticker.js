@@ -31,6 +31,33 @@ const escTicker = (value) => String(value ?? '')
   .replace(/"/g, '&quot;')
   .replace(/'/g, '&#39;');
 
+// Alerts for one gtfs2 sensor as [{text, header, description}]. Prefers the
+// `alerts` attribute (every matching alert); falls back to the single
+// origin/destination keys when the sensor doesn't expose `alerts`.
+const gtfsTickerAlerts = (a) => {
+  const valid = v => v && String(v).trim() && String(v).toLowerCase() !== 'no info';
+  if (Array.isArray(a.alerts)) {
+    return a.alerts
+      .map(x => ({
+        text: String(x?.text ?? ''),
+        header: String(x?.header ?? ''),
+        description: String(x?.description ?? ''),
+      }))
+      .filter(x => valid(x.text));
+  }
+  const out = [];
+  for (const k of ['origin', 'destination']) {
+    const text = a[`${k}_stop_alert`];
+    if (!valid(text) || out.some(x => x.text === String(text))) continue;
+    out.push({
+      text: String(text),
+      header: String(a[`${k}_stop_alert_header`] ?? ''),
+      description: String(a[`${k}_stop_alert_desc`] ?? ''),
+    });
+  }
+  return out;
+};
+
 class GtfsAlertsTicker extends HTMLElement {
 
   setConfig(config) {
@@ -98,7 +125,7 @@ class GtfsAlertsTicker extends HTMLElement {
       ]
         .map(keyword => String(keyword).trim().toLowerCase())
         .filter(Boolean);
-      [a.origin_stop_alert, a.destination_stop_alert].forEach(v => {
+      gtfsTickerAlerts(a).forEach(({ text: v }) => {
         if (
           v &&
           v.toLowerCase() !== 'no info' &&
