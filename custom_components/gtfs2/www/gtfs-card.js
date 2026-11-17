@@ -491,8 +491,8 @@ class PublicTransitCard extends HTMLElement {
       // silently disappears.
       const footerAlerts = (showAlerts && showAlertDetails)
         ? [
-            [a.origin_stop_alert,      a.origin_stop_alert_header],
-            [a.destination_stop_alert, a.destination_stop_alert_header],
+            [a.origin_stop_alert_desc,      a.origin_stop_alert_header],
+            [a.destination_stop_alert_desc, a.destination_stop_alert_header],
           ]
             .filter(([full]) => full && String(full).toLowerCase() !== 'no info')
             .filter(([full]) => !alertExclusionsForBadge.some(k =>

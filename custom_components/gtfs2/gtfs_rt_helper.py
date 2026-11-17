@@ -621,6 +621,93 @@ def get_rt_vehicle_positions(self):
     update_geojson(self)
     return geojson_body
     
+MAX_RT_ALERTS = 20
+
+
+def _alert_match_types(self, stop_id, route_id):
+    """Return how one informed_entity relates to this sensor (may be empty)."""
+    matches = []
+    route_ok = route_id == "unknown" or route_id == self._route_id
+    if stop_id == self._stop_id and route_ok:
+        matches.append("origin_stop")
+    if stop_id == self._destination_id and route_ok:
+        matches.append("destination_stop")
+    if route_id == self._route_id:
+        matches.append("route")
+    return matches
+
+
+def _record_alert(self, rt_alerts, alert_id, header, desc, text, informed):
+    """Add one feed alert to rt_alerts["alerts"] if any informed_entity matches.
+
+    informed is a list of (stop_id, route_id) tuples. An alert is kept once even
+    if several of its informed_entity entries match; the match types are merged.
+    Alerts with identical header + description are treated as duplicates.
+
+    If the alert names specific routes (in any informed_entity) and none of them
+    is this sensor's route, it is ignored entirely: a stop-only entry on such an
+    alert is not a station-wide notice, it just locates the affected route's
+    stop. Alerts that name no routes still match by stop as before.
+    """
+    named_routes = []
+    for _stop_id, route_id in informed:
+        if route_id != "unknown" and route_id not in named_routes:
+            named_routes.append(route_id)
+    if named_routes and not any(route_ids_match(r, self._route_id) for r in named_routes):
+        _LOGGER.debug("RT Alert %s names routes %s, none is %s; skipping", alert_id, named_routes, self._route_id)
+        return
+
+    matches = []
+    for stop_id, route_id in informed:
+        _LOGGER.debug("RT Alert check — route: %s, stop: %s, self_route: %s, self_stop: %s, self_dest: %s",
+            route_id, stop_id, self._route_id, self._stop_id, self._destination_id)
+        for match in _alert_match_types(self, stop_id, route_id):
+            if match not in matches:
+                matches.append(match)
+    if not matches:
+        return
+
+    alerts = rt_alerts.setdefault("alerts", [])
+    for existing in alerts:
+        if existing["header"] == header and existing["description"] == desc:
+            for match in matches:
+                if match not in existing["match"]:
+                    existing["match"].append(match)
+            for route in named_routes:
+                if route not in existing["routes"]:
+                    existing["routes"].append(route)
+            return
+    if len(alerts) >= MAX_RT_ALERTS:
+        _LOGGER.debug("RT Alert limit (%s) reached, skipping alert: %s", MAX_RT_ALERTS, alert_id)
+        return
+    alerts.append({
+        "id": alert_id,
+        "header": header,
+        "description": desc,
+        "text": text,
+        "match": matches,
+        "routes": named_routes,
+    })
+
+
+def _fill_legacy_alert_keys(rt_alerts):
+    """Fill the single-alert keys used by existing cards.
+
+    For each of origin/destination, a stop-specific match wins over a
+    route-wide one; within the same kind, the first alert in feed order wins.
+    """
+    alerts = rt_alerts.get("alerts") or []
+    for slot in ("origin", "destination"):
+        chosen = next((a for a in alerts if f"{slot}_stop" in a["match"]), None)
+        if chosen is None:
+            chosen = next((a for a in alerts if "route" in a["match"]), None)
+        if chosen is None:
+            continue
+        rt_alerts[f"{slot}_stop_alert"] = chosen["text"]
+        rt_alerts[f"{slot}_stop_alert_header"] = chosen["header"]
+        rt_alerts[f"{slot}_stop_alert_desc"] = chosen["description"]
+
+
 def get_rt_alerts(self):
     rt_alerts = {}
     if not self._alerts_url or not self._alerts_url.startswith("http"):
@@ -660,6 +747,7 @@ def get_rt_alerts(self):
             # multiple routes/stops are not filtered down to just the last one.
             # Route-only alerts (no stop_id, e.g. TTC subway detours) must still
             # resolve their route_id from the informed entity.
+            informed = []
             for x in entity.alert.informed_entity:
                 try:
                     stop_id = x.stop_id if x.HasField("stop_id") else "unknown"
@@ -669,28 +757,10 @@ def get_rt_alerts(self):
                     route_id = x.route_id if x.HasField("route_id") else "unknown"
                 except ValueError:
                     route_id = x.route_id or "unknown"
+                informed.append((stop_id, route_id))
+            _record_alert(self, rt_alerts, entity.id, alert_header, alert_desc, alert_text, informed)
 
-                _LOGGER.debug("RT Alert check — route: %s, stop: %s, self_route: %s, self_stop: %s, self_dest: %s",
-                    route_id, stop_id, self._route_id, self._stop_id, self._destination_id)
-
-                if stop_id == self._stop_id and (route_id == "unknown" or route_id == self._route_id):
-                    _LOGGER.debug("RT Alert matched origin stop for route: %s, stop: %s", route_id, stop_id)
-                    rt_alerts["origin_stop_alert"] = alert_text
-                    rt_alerts["origin_stop_alert_header"] = alert_header
-                    rt_alerts["origin_stop_alert_desc"] = alert_desc
-                if stop_id == self._destination_id and (route_id == "unknown" or route_id == self._route_id):
-                    _LOGGER.debug("RT Alert matched destination stop for route: %s, stop: %s", route_id, stop_id)
-                    rt_alerts["destination_stop_alert"] = alert_text
-                    rt_alerts["destination_stop_alert_header"] = alert_header
-                    rt_alerts["destination_stop_alert_desc"] = alert_desc
-                if route_id == self._route_id:
-                    _LOGGER.debug("RT Alert matched route (no stop filter) for route: %s", route_id)
-                    rt_alerts["origin_stop_alert"] = alert_text
-                    rt_alerts["origin_stop_alert_header"] = alert_header
-                    rt_alerts["origin_stop_alert_desc"] = alert_desc
-                    rt_alerts["destination_stop_alert"] = alert_text
-                    rt_alerts["destination_stop_alert_header"] = alert_header
-                    rt_alerts["destination_stop_alert_desc"] = alert_desc
+    _fill_legacy_alert_keys(rt_alerts)
 
     return rt_alerts
     
@@ -723,31 +793,13 @@ def get_rt_alerts_json(self):
 
             # Evaluate each informed_entity independently (as in get_rt_alerts):
             # loop over all entities and match inside the loop.
-            for x in alert.get("informed_entity", []):
-                stop_id = x.get("stop_id") or "unknown"
-                route_id = x.get("route_id") or "unknown"
+            informed = [
+                (x.get("stop_id") or "unknown", x.get("route_id") or "unknown")
+                for x in alert.get("informed_entity", [])
+            ]
+            _record_alert(self, rt_alerts, entity.get("id") or alert.get("id", ""), alert_header, alert_desc, alert_text, informed)
 
-                _LOGGER.debug("RT Alert JSON check — route: %s, stop: %s, self_route: %s, self_stop: %s, self_dest: %s",
-                    route_id, stop_id, self._route_id, self._stop_id, self._destination_id)
-
-                if stop_id == self._stop_id and (route_id == "unknown" or route_id == self._route_id):
-                    _LOGGER.debug("RT Alert JSON matched origin stop for route: %s, stop: %s", route_id, stop_id)
-                    rt_alerts["origin_stop_alert"] = alert_text
-                    rt_alerts["origin_stop_alert_header"] = alert_header
-                    rt_alerts["origin_stop_alert_desc"] = alert_desc
-                if stop_id == self._destination_id and (route_id == "unknown" or route_id == self._route_id):
-                    _LOGGER.debug("RT Alert JSON matched destination stop for route: %s, stop: %s", route_id, stop_id)
-                    rt_alerts["destination_stop_alert"] = alert_text
-                    rt_alerts["destination_stop_alert_header"] = alert_header
-                    rt_alerts["destination_stop_alert_desc"] = alert_desc
-                if route_id == self._route_id:
-                    _LOGGER.debug("RT Alert JSON matched route (no stop filter) for route: %s", route_id)
-                    rt_alerts["origin_stop_alert"] = alert_text
-                    rt_alerts["origin_stop_alert_header"] = alert_header
-                    rt_alerts["origin_stop_alert_desc"] = alert_desc
-                    rt_alerts["destination_stop_alert"] = alert_text
-                    rt_alerts["destination_stop_alert_header"] = alert_header
-                    rt_alerts["destination_stop_alert_desc"] = alert_desc
+    _fill_legacy_alert_keys(rt_alerts)
 
     return rt_alerts
     
